@@ -1,0 +1,2156 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:dio/dio.dart';
+
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_shadows.dart';
+import '../../core/theme/app_text_styles.dart';
+import '../../domain/entities/recording.dart';
+import '../../domain/entities/assigned_user.dart';
+import '../../domain/entities/user.dart';
+import '../../domain/repositories/recording_repository.dart';
+import '../../data/providers.dart';
+import '../../services/auth_session.dart';
+import '../../services/dio_error_mapper.dart';
+import '../auth/auth_controller.dart';
+import '../navigation/side_navigation_rail.dart';
+import '../player/mini_player_bar.dart';
+import '../widgets/app_shell.dart';
+import 'recording_detail_screen.dart' show assignedUsersProvider;
+import 'recordings_controller.dart';
+import '../../services/update_manager.dart';
+
+class RecordingsScreen extends ConsumerStatefulWidget {
+  const RecordingsScreen({super.key});
+
+  @override
+  ConsumerState<RecordingsScreen> createState() => _RecordingsScreenState();
+}
+
+class _RecordingsScreenState extends ConsumerState<RecordingsScreen> {
+  @override
+  void initState() {
+    super.initState();
+    
+    // Auto-check for updates in background on dashboard load
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final hasUpdate = await UpdateManager.checkForUpdatesBackground();
+      if (hasUpdate && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.system_update, color: Colors.white, size: 20),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                      'A new version is available! Tap the update icon to install.'),
+                ),
+              ],
+            ),
+            backgroundColor: AppColors.primaryDark,
+            duration: const Duration(seconds: 6),
+            action: SnackBarAction(
+              label: 'VIEW',
+              textColor: Colors.white,
+              onPressed: () {
+                context.go('/system');
+              },
+            ),
+          ),
+        );
+      }
+    });
+  }
+
+  bool _canAssign(String? role) {
+    final normalized = role?.toLowerCase().trim();
+    return normalized == 'admin' ||
+        normalized == 'super_admin' ||
+        normalized == 'superadmin';
+  }
+
+  void _showCurrentUserDialog(BuildContext context) {
+    final user = ref.read(authSessionProvider).user;
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Not logged in')),
+      );
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.person, color: const Color(0xFF115343)),
+            const SizedBox(width: 8),
+            Text(
+              'Current user',
+              style: GoogleFonts.roboto(fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _userDetailRow('User ID', user.id),
+              const SizedBox(height: 10),
+              _userDetailRow('Name', user.name),
+              const SizedBox(height: 10),
+              _userDetailRow('Email', user.email),
+              const SizedBox(height: 10),
+              _userDetailRow('Role', user.role),
+              if (user.province != null && user.province!.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                _userDetailRow('Province', user.province!),
+              ],
+              if (user.court != null && user.court!.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                _userDetailRow('Court', user.court!),
+              ],
+              if (user.contactInfo != null && user.contactInfo!.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                _userDetailRow('Contact', user.contactInfo!),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _userDetailRow(String label, String value) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 90,
+          child: Text(
+            '$label:',
+            style: GoogleFonts.roboto(
+              fontWeight: FontWeight.w600,
+              color: Colors.grey.shade700,
+              fontSize: 13,
+            ),
+          ),
+        ),
+        Expanded(
+          child: SelectableText(
+            value,
+            style: GoogleFonts.roboto(fontSize: 13),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(recordingsControllerProvider);
+    final controller = ref.read(recordingsControllerProvider.notifier);
+    final auth = ref.watch(authSessionProvider);
+    print('[RecordingsScreen] build items=${state.items.length} '
+        'loading=${state.isLoading} error=${state.errorMessage} '
+        'tab=${state.filters.tab.name}');
+
+    // Invalidate the entire assigned-users family whenever a fresh reload is
+    // kicked off (loadInitial / tab switch / filter change / pull-to-refresh
+    // / post assign-unassign). This guarantees every tile re-fetches its
+    // per-row assignment status from the API.
+    ref.listen(recordingsControllerProvider, (previous, next) {
+      final isFreshLoad =
+          next.isLoading && next.page == 1 && next.items.isEmpty;
+      if (isFreshLoad) {
+        ref.invalidate(assignedUsersProvider);
+      }
+    });
+
+    return AppShell(
+      bottomBar: const MiniPlayerBar(),
+      child: Row(
+        children: [
+          SideNavigationRail(
+            selected: AppNavDestination.recordings,
+            userName: auth.user?.name.trim().isNotEmpty == true
+                ? auth.user!.name
+                : auth.user?.email,
+            onUserTap: () => _showCurrentUserDialog(context),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _RecordingsHeader(
+                  userName: auth.user?.name.trim().isNotEmpty == true
+                      ? auth.user!.name
+                      : auth.user?.email,
+                  onRefresh: controller.loadInitial,
+                  onUpload: () => context.go('/upload-recording'),
+                  onSystem: () => context.go('/system'),
+                ),
+                if (auth.offlineOnly)
+                  Material(
+                    color: AppColors.warningBg,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 10),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.cloud_off_outlined,
+                              color: AppColors.warningText, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Offline sign-in — server features need an online '
+                              'sign-in while this device has a JWT.',
+                              style: AppTextStyles.tileSnippet.copyWith(
+                                color: AppColors.warningText,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                Expanded(
+                  child: Row(
+                    children: [
+                      if (state.filters.tab != RecordingTab.savedOffline)
+                        Container(
+                          width: 300,
+                          decoration: const BoxDecoration(
+                            color: AppColors.surfaceGlassSubtle,
+                            border: Border(
+                              right: BorderSide(
+                                color: AppColors.borderSubtle,
+                                width: 1,
+                              ),
+                            ),
+                          ),
+                          child: _CourtFilterSidebar(
+                            selectedCourt: state.filters.court,
+                            selectedCourtroom: state.filters.courtroom,
+                            onCourtSelected: (court) =>
+                                controller.updateFilters(
+                              RecordingFilters(
+                                court: court,
+                                courtroom: null,
+                                query: state.filters.query,
+                                fromDate: state.filters.fromDate,
+                                toDate: state.filters.toDate,
+                                tab: state.filters.tab,
+                              ),
+                            ),
+                            onCourtroomSelected: (courtroom) {
+                              controller.updateFilters(
+                                RecordingFilters(
+                                  court: state.filters.court,
+                                  courtroom: courtroom,
+                                  query: state.filters.query,
+                                  fromDate: state.filters.fromDate,
+                                  toDate: state.filters.toDate,
+                                  tab: state.filters.tab,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      Expanded(
+                        child: Column(
+                          children: [
+                            if (auth.isAuthenticated)
+                              _TabsBar(
+                                selected: state.filters.tab,
+                                onChanged: (tab) => controller.updateFilters(
+                                  RecordingFilters(
+                                    court: state.filters.court,
+                                    courtroom: state.filters.courtroom,
+                                    query: state.filters.query,
+                                    fromDate: state.filters.fromDate,
+                                    toDate: state.filters.toDate,
+                                    tab: tab,
+                                  ),
+                                ),
+                              ),
+                            if (state.filters.tab != RecordingTab.savedOffline)
+                              _FiltersBar(
+                                filters: state.filters,
+                                onFiltersChanged: controller.updateFilters,
+                              ),
+                            if (!state.isLoading &&
+                                state.errorMessage != null &&
+                                state.errorMessage!.isNotEmpty)
+                              Padding(
+                                padding:
+                                    const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                                child: Text(
+                                  state.errorMessage!,
+                                  style: AppTextStyles.tileSnippet.copyWith(
+                                    color: AppColors.warningText,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ),
+                            Expanded(
+                              child: state.isLoading && state.items.isEmpty
+                                  ? const Center(
+                                      child: CircularProgressIndicator(
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(
+                                          AppColors.primaryDark,
+                                        ),
+                                      ),
+                                    )
+                                  : RefreshIndicator(
+                                      color: AppColors.primaryDark,
+                                      onRefresh: controller.loadInitial,
+                                      child: ListView.builder(
+                                        padding: const EdgeInsets.fromLTRB(
+                                            12, 4, 12, 16),
+                                        itemCount: state.items.length +
+                                            (state.filters.tab ==
+                                                    RecordingTab.savedOffline
+                                                ? 0
+                                                : 1),
+                                        itemBuilder: (context, index) {
+                                          if (index >= state.items.length) {
+                                            if (state.filters.tab ==
+                                                RecordingTab.savedOffline) {
+                                              return const SizedBox.shrink();
+                                            }
+                                            return Padding(
+                                              padding:
+                                                  const EdgeInsets.all(16),
+                                              child: TextButton(
+                                                onPressed: state.isLoading
+                                                    ? null
+                                                    : () => controller
+                                                        .loadMore(),
+                                                child: state.isLoading
+                                                    ? const SizedBox(
+                                                        width: 22,
+                                                        height: 22,
+                                                        child:
+                                                            CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                        ),
+                                                      )
+                                                    : Text(
+                                                        'Load more',
+                                                        style: AppTextStyles
+                                                            .tileTitle
+                                                            .copyWith(
+                                                          color: AppColors
+                                                              .brandDeep,
+                                                        ),
+                                                      ),
+                                              ),
+                                            );
+                                          }
+                                          final recording =
+                                              state.items[index];
+                                          return _RecordingTile(
+                                            recording: recording,
+                                            isMyList: state.filters.tab ==
+                                                    RecordingTab.myList ||
+                                                state.filters.tab ==
+                                                    RecordingTab
+                                                        .savedOffline,
+                                            isSavedOfflineTab:
+                                                state.filters.tab ==
+                                                    RecordingTab
+                                                        .savedOffline,
+                                            canAssign: _canAssign(
+                                                auth.user?.role),
+                                          );
+                                        },
+                                      ),
+                                    ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RecordingsHeader extends StatelessWidget {
+  const _RecordingsHeader({
+    required this.onRefresh,
+    required this.onUpload,
+    required this.onSystem,
+    this.userName,
+  });
+
+  final String? userName;
+  final VoidCallback onRefresh;
+  final VoidCallback onUpload;
+  final VoidCallback onSystem;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(24, 20, 16, 12),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: AppColors.borderSubtle, width: 1),
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Recordings', style: AppTextStyles.headerLarge),
+                const SizedBox(height: 2),
+                Text(
+                  'v${UpdateManager.appDisplayVersion ?? UpdateManager.bundledAppVersion}'
+                  '${userName != null && userName!.isNotEmpty ? '  ·  $userName' : ''}',
+                  style: AppTextStyles.tileTimestamp,
+                ),
+              ],
+            ),
+          ),
+          StreamBuilder<bool>(
+            stream: UpdateManager.updateAvailableStream,
+            initialData: UpdateManager.isUpdateAvailable,
+            builder: (context, snapshot) {
+              final hasUpdate = snapshot.data ?? false;
+              return Badge(
+                isLabelVisible: hasUpdate,
+                backgroundColor: AppColors.badgeOrange,
+                child: _HeaderIconButton(
+                  icon: Icons.system_update_alt_rounded,
+                  tooltip: hasUpdate
+                      ? 'New update available'
+                      : 'System status',
+                  onPressed: onSystem,
+                ),
+              );
+            },
+          ),
+          _HeaderIconButton(
+            icon: Icons.refresh_rounded,
+            tooltip: 'Refresh',
+            onPressed: onRefresh,
+          ),
+          _HeaderIconButton(
+            icon: Icons.upload_file_rounded,
+            tooltip: 'Upload recording',
+            onPressed: onUpload,
+            filled: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _HeaderIconButton extends StatelessWidget {
+  const _HeaderIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+    this.filled = false,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+  final bool filled;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: Tooltip(
+        message: tooltip,
+        child: Material(
+          color: filled ? AppColors.primaryDark : AppColors.surfaceSearchInput,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onPressed,
+            child: SizedBox(
+              width: 42,
+              height: 42,
+              child: Icon(
+                icon,
+                size: 20,
+                color: filled ? Colors.white : AppColors.textSecondary,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RecordingTile extends ConsumerStatefulWidget {
+  const _RecordingTile({
+    required this.recording,
+    required this.isMyList,
+    required this.isSavedOfflineTab,
+    required this.canAssign,
+  });
+
+  final Recording recording;
+  final bool isMyList;
+  final bool isSavedOfflineTab;
+  final bool canAssign;
+
+  @override
+  ConsumerState<_RecordingTile> createState() => _RecordingTileState();
+}
+
+class _RecordingTileState extends ConsumerState<_RecordingTile> {
+  bool _isOperationInProgress = false;
+
+  Color _getStatusColor(String status) {
+    switch (status.toLowerCase()) {
+      case 'pending':
+        return const Color(0xFFFF9800); // Orange
+      case 'in_progress':
+        return const Color(0xFF2196F3); // Blue
+      case 'completed':
+        return const Color(0xFF4CAF50); // Green
+      case 'reviewed':
+        return const Color(0xFF9C27B0); // Purple
+      default:
+        return const Color(0xFF757575); // Grey
+    }
+  }
+
+  String _formatDuration(double? seconds) {
+    if (seconds == null) return 'Duration N/A';
+    final totalSeconds = seconds.floor();
+    if (totalSeconds <= 0) return 'Duration N/A';
+
+    final hours = totalSeconds ~/ 3600;
+    final minutes = (totalSeconds % 3600) ~/ 60;
+    final remainingSeconds = totalSeconds % 60;
+
+    final parts = <String>[];
+    if (hours > 0) {
+      parts.add('${hours}h');
+    }
+    if (minutes > 0 || hours > 0) {
+      parts.add('${minutes}m');
+    }
+    parts.add('${remainingSeconds}s');
+
+    return parts.join(' ');
+  }
+
+  Future<void> _handleAddToMyList() async {
+    if (_isOperationInProgress) return;
+    
+    final userId = ref.read(authSessionProvider).user?.id;
+    if (userId == null || userId.isEmpty) {
+      await ref.read(authControllerProvider).logout();
+      return;
+    }
+
+    setState(() => _isOperationInProgress = true);
+    
+    try {
+      // Step 1: Call API and wait for response
+      print('[RecordingsScreen] POST /add_transcription_user case_id=${widget.recording.id} user_id=$userId');
+      await ref.read(assignmentRepositoryProvider).assignRecording(
+        widget.recording.id,
+        userId: userId,
+      );
+      print('[RecordingsScreen] API returned success');
+
+      // Step 2: Refresh per-row assignment state and the list
+      ref.invalidate(assignedUsersProvider(widget.recording.id));
+      print('[RecordingsScreen] Clearing state and reloading from API...');
+      final controller = ref.read(recordingsControllerProvider.notifier);
+      await controller.loadInitial();
+      print('[RecordingsScreen] Reload from API completed');
+      
+      // Note: No snackbar - the UI will update because we reloaded from API
+    } catch (e) {
+      print('[RecordingsScreen] API error: $e');
+      if (mounted) {
+        String errorMessage = 'Failed to add to list';
+        
+        if (e is DioException) {
+          final statusCode = e.response?.statusCode;
+          final responseData = e.response?.data;
+          
+          // Check for duplicate/conflict errors (400 or 409)
+          if (statusCode == 400 || statusCode == 409) {
+            // Check if it's a duplicate error
+            String? apiMessage;
+            if (responseData is Map) {
+              apiMessage = responseData['message']?.toString() ?? 
+                          responseData['error']?.toString();
+            } else if (responseData is String) {
+              apiMessage = responseData;
+            }
+            
+            // Check if the message indicates a duplicate
+            final messageLower = (apiMessage ?? '').toLowerCase();
+            if (messageLower.contains('duplicate') || 
+                messageLower.contains('already') || 
+                messageLower.contains('exists') ||
+                messageLower.contains('already assigned')) {
+              errorMessage = 'This case is already in your list';
+            } else if (apiMessage != null && apiMessage.isNotEmpty) {
+              // Use the API message if it's short and clear
+              errorMessage = apiMessage.length > 100 
+                  ? 'This case is already in your list'
+                  : apiMessage;
+            } else {
+              errorMessage = 'This case is already in your list';
+            }
+          } else {
+            // For other errors, try to extract a clean message
+            if (responseData is Map) {
+              final apiMessage = responseData['message']?.toString() ?? 
+                                responseData['error']?.toString();
+              if (apiMessage != null && apiMessage.isNotEmpty) {
+                // Only use if it's a reasonable length
+                errorMessage = apiMessage.length > 150 
+                    ? 'Failed to add to list. Please try again.'
+                    : apiMessage;
+              }
+            } else if (responseData is String && responseData.length <= 150) {
+              errorMessage = responseData;
+            } else {
+              errorMessage = 'Failed to add to list. Please try again.';
+            }
+          }
+        }
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: errorMessage.contains('already') 
+                ? Colors.orange.shade700 
+                : Colors.red.shade700,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isOperationInProgress = false);
+      }
+    }
+  }
+
+  Future<void> _handleRemoveFromMyList() async {
+    if (_isOperationInProgress) return;
+    
+    final userId = ref.read(authSessionProvider).user?.id;
+    if (userId == null || userId.isEmpty) {
+      await ref.read(authControllerProvider).logout();
+      return;
+    }
+
+    setState(() => _isOperationInProgress = true);
+    
+    try {
+      // Step 1: Call API and wait for response
+      print('[RecordingsScreen] DELETE unassign case_id=${widget.recording.id} user_id=$userId');
+      await ref.read(assignmentRepositoryProvider).unassignRecording(
+        widget.recording.id,
+        userId: userId,
+      );
+      print('[RecordingsScreen] API returned success');
+
+      // Step 2: Refresh per-row assignment state and the list
+      ref.invalidate(assignedUsersProvider(widget.recording.id));
+      print('[RecordingsScreen] Clearing state and reloading from API...');
+      final controller = ref.read(recordingsControllerProvider.notifier);
+      await controller.loadInitial();
+      print('[RecordingsScreen] Reload from API completed');
+      
+      // Note: No snackbar - the UI will update because we reloaded from API
+    } catch (e) {
+      print('[RecordingsScreen] API error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to remove from list: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isOperationInProgress = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final date = DateFormat.yMMMd().format(widget.recording.date);
+    final status = (widget.recording.status.isEmpty ? 'pending' : widget.recording.status);
+    final durationLabel = _formatDuration(widget.recording.durationSeconds);
+
+    // Per-row "is this recording assigned to me?" check. Falls back to the tab
+    // hint while the first load is still pending so the button never flickers
+    // to the wrong label.
+    final currentUserId = ref.watch(authSessionProvider).user?.id;
+    final assignedUsersAsync =
+        ref.watch(assignedUsersProvider(widget.recording.id));
+    final bool isAssignedToMe = assignedUsersAsync.when(
+      data: (users) =>
+          currentUserId != null &&
+          users.any((u) => u.userId == currentUserId),
+      loading: () => widget.isMyList,
+      error: (_, __) => widget.isMyList,
+    );
+    final metaChips = <Widget>[
+      _MetaChip(icon: Icons.calendar_today, label: date),
+      _MetaChip(icon: Icons.account_balance, label: widget.recording.court),
+      _MetaChip(icon: Icons.meeting_room, label: widget.recording.courtroom),
+      _MetaChip(icon: Icons.schedule, label: durationLabel),
+    ];
+    if (widget.recording.judgeName.isNotEmpty) {
+      metaChips.add(
+        _MetaChip(icon: Icons.gavel, label: widget.recording.judgeName),
+      );
+    }
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceCard,
+        borderRadius: BorderRadius.circular(AppTokens.radiusTile),
+        boxShadow: AppTokens.bubbleShadow,
+        border: Border.all(color: AppColors.borderSubtle.withValues(alpha: 0.8)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    '${widget.recording.caseNumber} • ${widget.recording.title}',
+                    style: AppTextStyles.recipientName,
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: _getStatusColor(status).withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+                    border: Border.all(
+                      color: _getStatusColor(status).withValues(alpha: 0.3),
+                      width: 1,
+                    ),
+                  ),
+                  child: Text(
+                    status.toUpperCase(),
+                    style: AppTextStyles.tileTimestamp.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: _getStatusColor(status),
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 12,
+              runSpacing: 4,
+              children: metaChips,
+            ),
+            if (widget.isMyList) ...[
+              const SizedBox(height: 10),
+              _AssignedUsersRow(recordingId: widget.recording.id),
+            ],
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                if (widget.isSavedOfflineTab) ...[
+                  const Spacer(),
+                ],
+                if (!widget.isSavedOfflineTab && !isAssignedToMe)
+                  OutlinedButton.icon(
+                    onPressed: _isOperationInProgress ? null : _handleAddToMyList,
+                    icon: _isOperationInProgress
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.playlist_add, size: 18),
+                    label: Text(
+                      _isOperationInProgress ? 'Adding...' : 'Add to My List',
+                      style: GoogleFonts.roboto(fontWeight: FontWeight.w500),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF2E7D32),
+                      side: const BorderSide(color: Color(0xFF2E7D32)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                if (!widget.isSavedOfflineTab && isAssignedToMe)
+                  OutlinedButton.icon(
+                    onPressed: _isOperationInProgress ? null : _handleRemoveFromMyList,
+                    icon: _isOperationInProgress
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.remove_circle_outline, size: 18),
+                    label: Text(
+                      _isOperationInProgress ? 'Removing...' : 'Remove from My List',
+                      style: GoogleFonts.roboto(fontWeight: FontWeight.w500),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFD32F2F),
+                      side: const BorderSide(color: Color(0xFFD32F2F)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                const SizedBox(width: 10),
+                if (!widget.isSavedOfflineTab && widget.canAssign)
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      await showDialog(
+                        context: context,
+                        builder: (context) => _AssignToDialog(
+                          recordingId: widget.recording.id,
+                          recordingTitle: widget.recording.title,
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.person_add, size: 18),
+                    label: Text(
+                      'Assign To',
+                      style: GoogleFonts.roboto(fontWeight: FontWeight.w500),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF1E88E5),
+                      side: const BorderSide(color: Color(0xFF1E88E5)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                const Spacer(),
+                IconButton(
+                  onPressed: () => context.go(
+                    widget.isSavedOfflineTab
+                        ? '/recordings/offline/${widget.recording.id}'
+                        : '/recordings/${widget.recording.id}',
+                  ),
+                  tooltip: 'Open',
+                  icon: const Icon(Icons.arrow_forward_rounded,
+                      color: AppColors.primaryDark),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MetaChip extends StatelessWidget {
+  const _MetaChip({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceSelectedTile,
+        borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+        border: Border.all(color: AppColors.borderSubtle),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: AppColors.textSecondary),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: AppTextStyles.tileTimestamp.copyWith(
+              color: AppColors.textSecondary,
+              fontWeight: FontWeight.w500,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AssignedUsersRow extends ConsumerWidget {
+  const _AssignedUsersRow({required this.recordingId});
+
+  final String recordingId;
+
+  String _displayNameForAssignee(AssignedUser assignee) {
+    final name = assignee.name.trim();
+    if (name.isNotEmpty) return name;
+    return assignee.email.trim();
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return FutureBuilder(
+      future: ref.read(assignmentRepositoryProvider).getAssignedUsers(recordingId),
+      builder: (context, snapshot) {
+        final data = snapshot.data ?? const [];
+        if (data.isEmpty) return const SizedBox.shrink();
+
+        return Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              'Assigned:',
+              style: GoogleFonts.roboto(
+                fontSize: 12,
+                color: Colors.grey[600],
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            ...data.map((assignee) {
+              final label = _displayNameForAssignee(assignee);
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE9ECEF),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.grey.shade300),
+                ),
+                child: Text(
+                  label,
+                  style: GoogleFonts.roboto(
+                    fontSize: 12,
+                    color: Colors.grey[800],
+                  ),
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _AssignToDialog extends ConsumerStatefulWidget {
+  const _AssignToDialog({
+    required this.recordingId,
+    required this.recordingTitle,
+  });
+
+  final String recordingId;
+  final String recordingTitle;
+
+  @override
+  ConsumerState<_AssignToDialog> createState() => _AssignToDialogState();
+}
+
+class _AssignToDialogState extends ConsumerState<_AssignToDialog> {
+  final TextEditingController _searchController = TextEditingController();
+  bool _isLoadingUsers = true;
+  bool _isLoadingAssigned = true;
+  List<User> _users = [];
+  List<AssignedUser> _assigned = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadData() async {
+    await Future.wait([
+      _loadUsers(),
+      _loadAssigned(),
+    ]);
+  }
+
+  Future<void> _loadUsers() async {
+    if (!mounted) return;
+    setState(() => _isLoadingUsers = true);
+    try {
+      final users = await ref.read(assignmentRepositoryProvider).getAvailableUsers();
+      if (!mounted) return;
+      setState(() {
+        _users = users;
+        _isLoadingUsers = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isLoadingUsers = false);
+    }
+  }
+
+  Future<void> _loadAssigned() async {
+    if (!mounted) return;
+    setState(() => _isLoadingAssigned = true);
+    try {
+      final assigned =
+          await ref.read(assignmentRepositoryProvider).getAssignedUsers(
+                widget.recordingId,
+              );
+      if (!mounted) return;
+      setState(() {
+        _assigned = assigned;
+        _isLoadingAssigned = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isLoadingAssigned = false);
+    }
+  }
+
+  Future<void> _assignUser(User user) async {
+    final currentUser = ref.read(authSessionProvider).user;
+    if (currentUser == null) {
+      await ref.read(authControllerProvider).logout();
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+    print('[AssignToDialog] Assigning user ${user.id} to recording ${widget.recordingId}');
+    await ref.read(assignmentRepositoryProvider).assignRecording(
+          widget.recordingId,
+          userId: user.id,
+          type: user.email == currentUser.email
+              ? 'self_assigned'
+              : 'admin_assigned',
+        );
+    print('[AssignToDialog] Assignment completed, reloading...');
+    await _loadAssigned();
+    // Invalidate the per-row assignment cache so tiles refresh their button.
+    ref.invalidate(assignedUsersProvider(widget.recordingId));
+    // Also refresh the main recordings list
+    final recordingsController =
+        ref.read(recordingsControllerProvider.notifier);
+    await recordingsController.loadInitial();
+  }
+
+  Future<void> _removeAssignment(AssignedUser assignment) async {
+    final currentUser = ref.read(authSessionProvider).user;
+    if (currentUser == null) {
+      await ref.read(authControllerProvider).logout();
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+    if (assignment.id.isEmpty) return;
+    print('[AssignToDialog] Removing assignment ${assignment.id}');
+    await ref.read(assignmentRepositoryProvider).deleteAssignment(assignment.id);
+    print('[AssignToDialog] Removal completed, reloading...');
+    await _loadAssigned();
+    // Invalidate the per-row assignment cache so tiles refresh their button.
+    ref.invalidate(assignedUsersProvider(widget.recordingId));
+    // Also refresh the main recordings list
+    final recordingsController =
+        ref.read(recordingsControllerProvider.notifier);
+    await recordingsController.loadInitial();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final query = _searchController.text.trim().toLowerCase();
+    final assignedUserIds = _assigned.map((e) => e.userId).toSet();
+    final filteredUsers = _users.where((user) {
+      if (assignedUserIds.contains(user.id)) return false;
+      if (query.isEmpty) return true;
+      return user.name.toLowerCase().contains(query) ||
+          user.email.toLowerCase().contains(query) ||
+          (user.court ?? '').toLowerCase().contains(query) ||
+          user.role.toLowerCase().contains(query);
+    }).toList();
+
+    return AlertDialog(
+      title: Text(
+        'Assign Recording',
+        style: GoogleFonts.roboto(fontWeight: FontWeight.w600),
+      ),
+      content: SizedBox(
+        width: 520,
+        height: 500, // Fixed height to prevent overflow
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.recordingTitle,
+                style: GoogleFonts.roboto(
+                  color: Colors.grey[700],
+                  fontSize: 13,
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _searchController,
+                decoration: InputDecoration(
+                  hintText: 'Search by name, email, court, or role...',
+                  prefixIcon: const Icon(Icons.search),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Available Users',
+                style: GoogleFonts.roboto(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              if (_isLoadingUsers)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Center(child: CircularProgressIndicator()),
+                )
+              else if (filteredUsers.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    'No users found',
+                    style: GoogleFonts.roboto(color: Colors.grey[600]),
+                  ),
+                )
+              else
+                Container(
+                  height: 150,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: filteredUsers.length,
+                    itemBuilder: (context, index) {
+                      final user = filteredUsers[index];
+                      return ListTile(
+                        dense: true,
+                        title: Text(user.name, style: GoogleFonts.roboto()),
+                        subtitle: Text(
+                          '${user.email} • ${user.role}',
+                          style: GoogleFonts.roboto(fontSize: 12),
+                        ),
+                        trailing: OutlinedButton(
+                          onPressed: () => _assignUser(user),
+                          child: const Text('Assign'),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              const SizedBox(height: 16),
+              Text(
+                'Currently Assigned',
+                style: GoogleFonts.roboto(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              if (_isLoadingAssigned)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Center(child: CircularProgressIndicator()),
+                )
+              else if (_assigned.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    'No assigned users',
+                    style: GoogleFonts.roboto(color: Colors.grey[600]),
+                  ),
+                )
+              else
+                Container(
+                  height: 120,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: _assigned.length,
+                    itemBuilder: (context, index) {
+                      final assigned = _assigned[index];
+                      return ListTile(
+                        dense: true,
+                        title: Text(
+                          assigned.name.isNotEmpty ? assigned.name : assigned.email,
+                          style: GoogleFonts.roboto(),
+                        ),
+                        subtitle: Text(
+                          assigned.email,
+                          style: GoogleFonts.roboto(fontSize: 12),
+                        ),
+                        trailing: OutlinedButton(
+                          onPressed: () => _removeAssignment(assigned),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFFD32F2F),
+                            side: const BorderSide(color: Color(0xFFD32F2F)),
+                          ),
+                          child: const Text('Remove'),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
+class _TabsBar extends StatelessWidget {
+  const _TabsBar({required this.selected, required this.onChanged});
+
+  final RecordingTab selected;
+  final ValueChanged<RecordingTab> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SegmentedButton<RecordingTab>(
+            emptySelectionAllowed: false,
+            showSelectedIcon: false,
+            style: SegmentedButton.styleFrom(
+              backgroundColor: AppColors.surfaceSearchInput,
+              foregroundColor: AppColors.textSecondary,
+              selectedBackgroundColor: AppColors.primaryDark,
+              selectedForegroundColor: AppColors.textLightPrimary,
+              side: BorderSide.none,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+              ),
+            ),
+            segments: [
+              ButtonSegment(
+                value: RecordingTab.all,
+                label: Text(
+                  'All Recordings',
+                  style: AppTextStyles.tileTitle.copyWith(
+                    color: selected == RecordingTab.all
+                        ? AppColors.textLightPrimary
+                        : AppColors.textSecondary,
+                  ),
+                ),
+              ),
+              ButtonSegment(
+                value: RecordingTab.myList,
+                label: Text(
+                  'My List',
+                  style: AppTextStyles.tileTitle.copyWith(
+                    color: selected == RecordingTab.myList
+                        ? AppColors.textLightPrimary
+                        : AppColors.textSecondary,
+                  ),
+                ),
+              ),
+              ButtonSegment(
+                value: RecordingTab.savedOffline,
+                label: Text(
+                  'Saved offline',
+                  style: AppTextStyles.tileTitle.copyWith(
+                    color: selected == RecordingTab.savedOffline
+                        ? AppColors.textLightPrimary
+                        : AppColors.textSecondary,
+                  ),
+                ),
+              ),
+            ],
+            selected: {selected},
+            onSelectionChanged: (value) {
+              if (value.isEmpty) return;
+              onChanged(value.first);
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FiltersBar extends StatefulWidget {
+  const _FiltersBar({required this.filters, required this.onFiltersChanged});
+
+  final RecordingFilters filters;
+  final ValueChanged<RecordingFilters> onFiltersChanged;
+
+  @override
+  State<_FiltersBar> createState() => _FiltersBarState();
+}
+
+class _FiltersBarState extends State<_FiltersBar> {
+  late final TextEditingController _searchController;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController = TextEditingController(text: widget.filters.query);
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _FiltersBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.filters.query != widget.filters.query) {
+      _searchController.text = widget.filters.query ?? '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceCard,
+        borderRadius: BorderRadius.circular(AppTokens.radiusTile),
+        boxShadow: AppTokens.bubbleShadow,
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _searchController,
+              style: AppTextStyles.body,
+              decoration: InputDecoration(
+                hintText: 'Search case number or title',
+                prefixIcon: const Icon(
+                  Icons.search_rounded,
+                  color: AppColors.textTertiary,
+                ),
+                filled: true,
+                fillColor: AppColors.surfaceSearchInput,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppTokens.radiusInput),
+                  borderSide: BorderSide.none,
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppTokens.radiusInput),
+                  borderSide: BorderSide.none,
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(AppTokens.radiusInput),
+                  borderSide: const BorderSide(color: AppColors.borderSubtle),
+                ),
+              ),
+              onSubmitted: (value) => widget.onFiltersChanged(
+                RecordingFilters(
+                  court: widget.filters.court,
+                  courtroom: widget.filters.courtroom,
+                  query: value,
+                  fromDate: widget.filters.fromDate,
+                  toDate: widget.filters.toDate,
+                  tab: widget.filters.tab,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          FilledButton.icon(
+            icon: const Icon(Icons.search_rounded, size: 18),
+            label: const Text('Search'),
+            onPressed: () => widget.onFiltersChanged(
+              RecordingFilters(
+                court: widget.filters.court,
+                courtroom: widget.filters.courtroom,
+                query: _searchController.text.trim(),
+                fromDate: widget.filters.fromDate,
+                toDate: widget.filters.toDate,
+                tab: widget.filters.tab,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.clear_rounded, size: 18),
+            label: Text(
+              'Clear',
+              style: AppTextStyles.tileTitle.copyWith(
+                color: AppColors.textSecondary,
+              ),
+            ),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.textSecondary,
+              side: const BorderSide(color: AppColors.borderSubtle),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            ),
+            onPressed: () {
+              _searchController.clear();
+              widget.onFiltersChanged(
+                RecordingFilters(
+                  court: widget.filters.court,
+                  courtroom: widget.filters.courtroom,
+                  query: null,
+                  fromDate: widget.filters.fromDate,
+                  toDate: widget.filters.toDate,
+                  tab: widget.filters.tab,
+                ),
+              );
+            },
+          ),
+          const SizedBox(width: 12),
+          OutlinedButton.icon(
+            icon: const Icon(
+              Icons.filter_alt_rounded,
+              color: AppColors.textSecondary,
+            ),
+            label: Text(
+              'Filters',
+              style: AppTextStyles.tileTitle.copyWith(
+                color: AppColors.textSecondary,
+              ),
+            ),
+            style: OutlinedButton.styleFrom(
+              side: const BorderSide(color: AppColors.borderSubtle),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            ),
+            onPressed: () async {
+              final result = await showDialog<RecordingFilters>(
+                context: context,
+                builder: (context) => _FilterDialog(filters: widget.filters),
+              );
+              if (result != null) {
+                widget.onFiltersChanged(result);
+              }
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FilterDialog extends StatefulWidget {
+  const _FilterDialog({required this.filters});
+
+  final RecordingFilters filters;
+
+  @override
+  State<_FilterDialog> createState() => _FilterDialogState();
+}
+
+class _FilterDialogState extends State<_FilterDialog> {
+  late DateTime? _fromDate = widget.filters.fromDate;
+  late DateTime? _toDate = widget.filters.toDate;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+      ),
+      title: Text(
+        'Filters',
+        style: GoogleFonts.roboto(
+          color: const Color(0xFF115343),
+          fontWeight: FontWeight.w600,
+          fontSize: 20,
+        ),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: _DateField(
+                  label: 'From',
+                  value: _fromDate,
+                  onChanged: (value) => setState(() => _fromDate = value),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _DateField(
+                  label: 'To',
+                  value: _toDate,
+                  onChanged: (value) => setState(() => _toDate = value),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(
+            'Cancel',
+            style: GoogleFonts.roboto(
+              color: Colors.grey[600],
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFF115343),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          onPressed: () => Navigator.of(context).pop(
+            RecordingFilters(
+              court: widget.filters.court,
+              courtroom: widget.filters.courtroom,
+              query: widget.filters.query,
+              fromDate: _fromDate,
+              toDate: _toDate,
+              tab: widget.filters.tab,
+            ),
+          ),
+          child: Text(
+            'Apply',
+            style: GoogleFonts.roboto(
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DateField extends StatelessWidget {
+  const _DateField({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final DateTime? value;
+  final ValueChanged<DateTime?> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextButton(
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.all(12),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: BorderSide(
+            color: const Color(0xFF115343).withOpacity(0.3),
+          ),
+        ),
+      ),
+      onPressed: () async {
+        final now = DateTime.now();
+        final picked = await showDatePicker(
+          context: context,
+          initialDate: value ?? now,
+          firstDate: DateTime(now.year - 3),
+          lastDate: DateTime(now.year + 1),
+          builder: (context, child) {
+            return Theme(
+              data: Theme.of(context).copyWith(
+                colorScheme: const ColorScheme.light(
+                  primary: Color(0xFF115343),
+                  onPrimary: Colors.white,
+                  surface: Colors.white,
+                  onSurface: Color(0xFF115343),
+                ),
+              ),
+              child: child!,
+            );
+          },
+        );
+        onChanged(picked);
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: GoogleFonts.roboto(
+              fontSize: 12,
+              color: Colors.grey[600],
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          Text(
+            value == null ? 'Any' : DateFormat.yMMMd().format(value!),
+            style: GoogleFonts.roboto(
+              color: const Color(0xFF115343),
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CourtFilterSidebar extends ConsumerStatefulWidget {
+  const _CourtFilterSidebar({
+    required this.selectedCourt,
+    required this.selectedCourtroom,
+    required this.onCourtSelected,
+    required this.onCourtroomSelected,
+  });
+
+  final String? selectedCourt;
+  final String? selectedCourtroom;
+  final ValueChanged<String?> onCourtSelected;
+  final ValueChanged<String?> onCourtroomSelected;
+
+  @override
+  ConsumerState<_CourtFilterSidebar> createState() =>
+      _CourtFilterSidebarState();
+}
+
+class _CourtFilterSidebarState extends ConsumerState<_CourtFilterSidebar> {
+  String? _selectedLetter;
+  bool _isLoading = true;
+  String? _errorMessage;
+  List<String> _courts = [];
+  Map<String, List<String>> _courtroomsByCourt = {};
+  final Map<String, GlobalKey> _courtKeys = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCourtsAndRooms();
+  }
+
+  Future<void> _loadCourtsAndRooms() async {
+    if (!mounted) return;
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+    try {
+      final repo = ref.read(recordingRepositoryProvider);
+      final results = await Future.wait([
+        repo.fetchCourts(),
+        repo.fetchCourtroomsByCourt(),
+      ]);
+      _courts = (results[0] as List<String>)..sort();
+      _courtroomsByCourt = results[1] as Map<String, List<String>>;
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _errorMessage = mapDioError(error);
+      });
+    }
+  }
+
+  List<String> get _filteredCourts {
+    if (_selectedLetter == null) return [];
+    return _courts.where((court) =>
+        court.toUpperCase().startsWith(_selectedLetter!)).toList()
+      ..sort();
+  }
+
+  List<String> _getCourtrooms(String court) {
+    return _courtroomsByCourt[court] ?? [];
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        // Header
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: AppColors.surfaceSelectedTile,
+            border: Border(
+              bottom: BorderSide(
+                color: AppColors.borderSubtle,
+                width: 1,
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              Text(
+                'Courts',
+                style: AppTextStyles.recipientName,
+              ),
+              const Spacer(),
+              if (widget.selectedCourt != null)
+                IconButton(
+                  onPressed: () {
+                    widget.onCourtSelected(null);
+                    widget.onCourtroomSelected(null);
+                  },
+                  icon: const Icon(
+                    Icons.clear_rounded,
+                    size: 20,
+                    color: AppColors.textTertiary,
+                  ),
+                  tooltip: 'Clear filter',
+                ),
+            ],
+          ),
+        ),
+
+        if (_isLoading)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: CircularProgressIndicator(),
+          )
+        else if (_errorMessage != null)
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text(
+              'Failed to load courts',
+              style: AppTextStyles.tileSnippet.copyWith(color: AppColors.danger),
+            ),
+          )
+        else
+          const SizedBox.shrink(),
+
+        // Fixed Alphabetical Index
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+          decoration: const BoxDecoration(
+            color: AppColors.surfaceCard,
+            border: Border(
+              bottom: BorderSide(
+                color: AppColors.borderSubtle,
+                width: 1,
+              ),
+            ),
+          ),
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 3,
+            runSpacing: 3,
+            children: List.generate(26, (index) {
+              final letter = String.fromCharCode(65 + index); // A-Z
+              final isSelected = _selectedLetter == letter;
+              final hasCourts = _courts.any((court) =>
+                  court.toUpperCase().startsWith(letter));
+
+              return InkWell(
+                onTap: hasCourts
+                    ? () {
+                        setState(() {
+                          _selectedLetter = isSelected ? null : letter;
+                        });
+                      }
+                    : null,
+                child: Container(
+                  width: 26,
+                  height: 26,
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? AppColors.primaryDark
+                        : hasCourts
+                            ? AppColors.surfaceSelectedTile
+                            : AppColors.surfaceSearchInput,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Center(
+                    child: Text(
+                      letter,
+                      style: AppTextStyles.tileTimestamp.copyWith(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: isSelected
+                            ? Colors.white
+                            : hasCourts
+                                ? AppColors.textPrimary
+                                : AppColors.textTertiary,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+
+        // Court List with Expandable Courtrooms
+        if (!_isLoading && _errorMessage == null)
+          Expanded(
+            child: ListView.builder(
+              itemCount: _getListItemCount(),
+              itemBuilder: (context, index) {
+                return _buildListItem(context, index);
+              },
+            ),
+          )
+        else
+          const Spacer(),
+
+        // Footer with instruction
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(
+                color: Colors.grey.withOpacity(0.2),
+                width: 1,
+              ),
+            ),
+            color: Colors.grey.withOpacity(0.05),
+          ),
+          child: Text(
+            _selectedLetter != null
+                ? 'Click court to select a courtroom'
+                : 'Select a letter to browse courts',
+            style: GoogleFonts.roboto(
+              fontSize: 11,
+              color: Colors.grey[600],
+              fontStyle: FontStyle.italic,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      ],
+    );
+  }
+
+  int _getListItemCount() {
+    if (_selectedLetter == null) return 0;
+    return _filteredCourts.length;
+  }
+
+  Widget _buildListItem(BuildContext context, int index) {
+    final courts = _filteredCourts;
+    if (index >= courts.length) return const SizedBox.shrink();
+    
+    final court = courts[index];
+    final isSelectedCourt = widget.selectedCourt == court;
+    final courtrooms = _getCourtrooms(court);
+    
+    return _buildCourtItem(court, isSelectedCourt, courtrooms.isNotEmpty);
+  }
+
+  Future<void> _showCourtroomDropdown(BuildContext context, String court, GlobalKey key) async {
+    final courtrooms = _getCourtrooms(court);
+    print('[CourtFilter] Showing dropdown for court: $court, courtrooms: ${courtrooms.length}');
+    if (courtrooms.isEmpty) {
+      print('[CourtFilter] No courtrooms for court: $court');
+      // No courtrooms, do nothing
+      return;
+    }
+
+    // Get the position of the court item
+    final RenderBox? renderBox = key.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null) {
+      print('[CourtFilter] Could not get render box for court: $court');
+      return;
+    }
+    print('[CourtFilter] Render box found, position: ${renderBox.localToGlobal(Offset.zero)}');
+
+    final RenderBox overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final Offset position = renderBox.localToGlobal(Offset.zero);
+
+    // Show menu below the court item
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx, // Left edge of court item
+        position.dy + renderBox.size.height, // Below the court item
+        overlay.size.width - position.dx, // Right edge
+        overlay.size.height - position.dy - renderBox.size.height, // Bottom
+      ),
+      items: [
+        // "All Courtrooms" option
+        PopupMenuItem<String>(
+          value: '__all__',
+          child: Row(
+            children: [
+              Icon(
+                Icons.clear_all,
+                size: 18,
+                color: widget.selectedCourtroom == null
+                    ? const Color(0xFF115343)
+                    : Colors.grey[600],
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'All Courtrooms',
+                style: GoogleFonts.roboto(
+                  fontSize: 14,
+                  fontWeight: widget.selectedCourtroom == null
+                      ? FontWeight.w600
+                      : FontWeight.w400,
+                  color: widget.selectedCourtroom == null
+                      ? const Color(0xFF115343)
+                      : Colors.grey[800],
+                ),
+              ),
+              if (widget.selectedCourtroom == null) ...[
+                const Spacer(),
+                Icon(
+                  Icons.check,
+                  size: 18,
+                  color: const Color(0xFF115343),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        // Individual courtrooms
+        ...courtrooms.map((courtroom) {
+          final isSelected = widget.selectedCourtroom == courtroom;
+          return PopupMenuItem<String>(
+            value: courtroom,
+            child: Row(
+              children: [
+                Icon(
+                  Icons.meeting_room,
+                  size: 18,
+                  color: isSelected
+                      ? const Color(0xFF115343)
+                      : Colors.grey[600],
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    courtroom,
+                    style: GoogleFonts.roboto(
+                      fontSize: 14,
+                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
+                      color: isSelected
+                          ? const Color(0xFF115343)
+                          : Colors.grey[800],
+                    ),
+                  ),
+                ),
+                if (isSelected)
+                  Icon(
+                    Icons.check,
+                    size: 18,
+                    color: const Color(0xFF115343),
+                  ),
+              ],
+            ),
+          );
+        }),
+      ],
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+      ),
+    );
+
+    if (selected != null && mounted) {
+      if (selected == '__all__') {
+        // Clear both court and courtroom filters
+        widget.onCourtSelected(null);
+        widget.onCourtroomSelected(null);
+      } else {
+        // Update both court and courtroom in a single call to ensure both are set
+        // Access the controller directly to update both filters atomically
+        final controller = ref.read(recordingsControllerProvider.notifier);
+        final currentState = ref.read(recordingsControllerProvider);
+        controller.updateFilters(
+          RecordingFilters(
+            court: court, // Set the court from the dropdown context
+            courtroom: selected, // Set the selected courtroom
+            query: currentState.filters.query,
+            fromDate: currentState.filters.fromDate,
+            toDate: currentState.filters.toDate,
+            tab: currentState.filters.tab,
+          ),
+        );
+      }
+    }
+  }
+
+  GlobalKey _getCourtKey(String court) {
+    if (!_courtKeys.containsKey(court)) {
+      _courtKeys[court] = GlobalKey();
+    }
+    return _courtKeys[court]!;
+  }
+
+  Widget _buildCourtItem(String court, bool isSelected, bool hasCourtrooms) {
+    final selectedCourtroom = widget.selectedCourt == court ? widget.selectedCourtroom : null;
+    final courtrooms = _getCourtrooms(court);
+    final courtKey = _getCourtKey(court);
+    
+    return InkWell(
+      key: courtKey,
+      onTap: () {
+        if (courtrooms.isNotEmpty) {
+          _showCourtroomDropdown(context, court, courtKey);
+        }
+        // If no courtrooms, do nothing
+      },
+      child: _buildCourtItemContent(court, isSelected, selectedCourtroom, hasCourtrooms),
+    );
+  }
+
+  Widget _buildCourtItemContent(String court, bool isSelected, String? selectedCourtroom, bool hasCourtrooms) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: isSelected
+            ? const Color(0xFF115343).withOpacity(0.08)
+            : null,
+        border: Border(
+          bottom: BorderSide(
+            color: Colors.grey.withOpacity(0.1),
+            width: 1,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.account_balance,
+                size: 18,
+                color: isSelected
+                    ? const Color(0xFF115343)
+                    : Colors.grey[600],
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  court,
+                  style: GoogleFonts.roboto(
+                    fontSize: 14,
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                    color: isSelected
+                        ? const Color(0xFF115343)
+                        : Colors.grey[800],
+                  ),
+                ),
+              ),
+              if (hasCourtrooms)
+                Icon(
+                  Icons.arrow_drop_down,
+                  size: 20,
+                  color: const Color(0xFF115343).withOpacity(0.6),
+                ),
+              if (isSelected && !hasCourtrooms)
+                Icon(
+                  Icons.check,
+                  size: 18,
+                  color: const Color(0xFF115343),
+                ),
+            ],
+          ),
+          if (selectedCourtroom != null) ...[
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 28),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.meeting_room,
+                    size: 14,
+                    color: const Color(0xFF115343).withOpacity(0.7),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      selectedCourtroom,
+                      style: GoogleFonts.roboto(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: const Color(0xFF115343).withOpacity(0.8),
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+}

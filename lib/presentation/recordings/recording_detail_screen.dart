@@ -1,0 +1,2312 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:dio/dio.dart';
+import 'package:file_selector/file_selector.dart';
+
+import '../comments/comments_panel.dart';
+import '../player/audio_player_controller.dart';
+import '../player/audio_enhancement_controller.dart';
+import '../player/audio_enhancement_panel.dart';
+import '../player/waveform_scrubber.dart';
+import '../transcript/transcript_controller.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_shadows.dart';
+import '../../core/theme/app_text_styles.dart';
+import '../../data/providers.dart';
+import '../../domain/entities/recording.dart';
+import '../../domain/entities/assigned_user.dart';
+import '../../services/auth_session.dart';
+import '../../app/providers.dart';
+import '../../services/dio_error_mapper.dart';
+import '../../services/update_manager.dart';
+import '../../utils/annotation_timestamp.dart';
+import '../navigation/side_navigation_rail.dart';
+import '../transcript/transcript_editor.dart';
+import '../widgets/app_shell.dart';
+import 'assignment_controller.dart';
+import 'recording_detail_controller.dart';
+import 'recordings_controller.dart';
+
+class RecordingDetailScreen extends ConsumerStatefulWidget {
+  const RecordingDetailScreen({
+    super.key,
+    required this.recordingId,
+    this.offline = false,
+  });
+
+  final String recordingId;
+  final bool offline;
+
+  @override
+  ConsumerState<RecordingDetailScreen> createState() =>
+      _RecordingDetailScreenState();
+}
+
+final assignedUsersProvider =
+    FutureProvider.autoDispose.family<List<AssignedUser>, String>((ref, recordingId) {
+  return ref.read(assignmentRepositoryProvider).getAssignedUsers(recordingId);
+});
+
+class _RecordingDetailScreenState
+    extends ConsumerState<RecordingDetailScreen> {
+  bool _transcriptExpanded = false;
+  Timer? _statusTimer;
+  Map<String, dynamic>? _transcriptionStatus;
+  String? _loadedRecordingId;
+  String? _lastKnownState;
+  int _pollErrorCount = 0;
+  static const int _maxPollErrors = 3;
+  bool _preparingEnhance = false;
+  double? _prepareProgress;
+  String _prepareStatus = '';
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.offline) {
+      // Strict real-time: drop any previously cached values for this recording
+      // id so every visit performs a fresh GET /recordings/:id and
+      // GET /transcription_users/:id instead of reusing a prior AsyncValue.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ref.invalidate(recordingDetailProvider(widget.recordingId));
+        ref.invalidate(assignedUsersProvider(widget.recordingId));
+      });
+      ref
+          .read(recordingDetailProvider(widget.recordingId).future)
+          .then((recording) {
+        ref
+            .read(audioPlayerControllerProvider.notifier)
+            .loadRecording(recording.audioPath);
+      });
+    } else {
+      // Offline: cached JSON + local audio if available.
+      ref
+          .read(offlineRecordingDetailProvider(widget.recordingId).future)
+          .then((recording) async {
+        if (!mounted || recording == null) return;
+        final userId = ref.read(authSessionProvider).user?.id ?? '';
+        if (userId.isEmpty) return;
+        final row = await ref.read(offlineAudioDownloadServiceProvider).row(
+              ownerUserId: userId,
+              recordingId: recording.id,
+            );
+        final local = row?.localPath;
+        if (local != null && local.isNotEmpty && File(local).existsSync()) {
+          await ref
+              .read(audioPlayerControllerProvider.notifier)
+              .loadLocalFile(local);
+          ref
+              .read(audioEnhancementControllerProvider.notifier)
+              .setOriginal(local);
+        } else {
+          await ref
+              .read(audioPlayerControllerProvider.notifier)
+              .loadRecording(recording.audioPath);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    print('[RecordingDetailScreen] dispose id=${widget.recordingId}');
+    _statusTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final recordingAsync = widget.offline
+        ? ref.watch(offlineRecordingDetailProvider(widget.recordingId))
+        : ref.watch(recordingDetailProvider(widget.recordingId));
+    final playerState = ref.watch(audioPlayerControllerProvider);
+    final playerController = ref.read(audioPlayerControllerProvider.notifier);
+    final assignmentState = ref.watch(assignmentControllerProvider);
+    final authSession = ref.watch(authSessionProvider);
+    final currentUserId = authSession.user?.id;
+    final hasApiKey = authSession.hasApiKey;
+
+    return AppShell(
+      child: Row(
+        children: [
+          SideNavigationRail(
+            selected: AppNavDestination.recordings,
+            userName: authSession.user?.name.trim().isNotEmpty == true
+                ? authSession.user!.name
+                : authSession.user?.email,
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+                  decoration: const BoxDecoration(
+                    color: AppColors.surfaceGlassSubtle,
+                    border: Border(
+                      bottom: BorderSide(
+                        color: AppColors.borderSubtle,
+                        width: 1,
+                      ),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Tooltip(
+                        message: 'Back to Recordings',
+                        child: Material(
+                          color: AppColors.surfaceSearchInput,
+                          shape: const CircleBorder(),
+                          child: InkWell(
+                            customBorder: const CircleBorder(),
+                            onTap: () {
+                              ref.invalidate(audioPlayerControllerProvider);
+                              ref.invalidate(
+                                audioEnhancementControllerProvider,
+                              );
+                              ref.invalidate(
+                                transcriptControllerProvider(
+                                  widget.recordingId,
+                                ),
+                              );
+                              ref
+                                  .read(recordingsControllerProvider.notifier)
+                                  .loadInitial();
+                              context.go('/recordings');
+                            },
+                            child: const SizedBox(
+                              width: 42,
+                              height: 42,
+                              child: Icon(
+                                Icons.arrow_back_rounded,
+                                size: 20,
+                                color: AppColors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Recording Player',
+                              style: AppTextStyles.headerLarge,
+                            ),
+                            Text(
+                              'v${UpdateManager.appDisplayVersion ?? UpdateManager.bundledAppVersion}',
+                              style: AppTextStyles.tileTimestamp,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: recordingAsync.when(
+                    data: (recording) {
+                      if (recording == null) {
+                        return Center(
+                          child: Text(
+                            'This recording is not saved on this device.',
+                            style: AppTextStyles.body.copyWith(
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.warningText,
+                            ),
+                          ),
+                        );
+                      }
+                      if (_loadedRecordingId != recording.id) {
+                        _loadedRecordingId = recording.id;
+                        if (!widget.offline) {
+                          _loadTranscriptionStatus(recording.id, poll: true);
+                        }
+                      }
+                      final assignedUsersAsync = widget.offline
+                          ? const AsyncValue.data(<AssignedUser>[])
+                          : ref.watch(assignedUsersProvider(recording.id));
+
+                      // API-key sessions have full access to every recording (no assignment gate).
+                      final isAssignedToMe = hasApiKey ||
+                          (assignedUsersAsync.whenOrNull(
+                                data: (users) {
+                                  final assigned = currentUserId != null &&
+                                      users.any(
+                                        (user) => user.userId == currentUserId,
+                                      );
+                                  print(
+                                    '[RecordingDetail] isAssignedToMe check: currentUserId=$currentUserId users=${users.map((u) => u.userId).toList()} result=$assigned',
+                                  );
+                                  return assigned;
+                                },
+                              ) ??
+                              false);
+
+                      print(
+                        '[RecordingDetail] Final isAssignedToMe=$isAssignedToMe hasApiKey=$hasApiKey (loading=${assignedUsersAsync.isLoading})',
+                      );
+
+                      return Stack(
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.all(20),
+                            child: Column(
+                              children: [
+                                Expanded(
+                                  child: Row(
+                                    children: [
+                                      if (!_transcriptExpanded)
+                                        Expanded(
+                                          flex: 4,
+                                          child: Container(
+                                            padding: const EdgeInsets.all(20),
+                                            decoration: BoxDecoration(
+                                              color: AppColors.surfaceCard,
+                                              borderRadius:
+                                                  BorderRadius.circular(
+                                                AppTokens.radiusCard,
+                                              ),
+                                              border: Border.all(
+                                                color: AppColors.borderSubtle,
+                                              ),
+                                              boxShadow: AppTokens.cardShadow,
+                                            ),
+                                            child: SingleChildScrollView(
+                                              child: Column(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(
+                                                    'Case: ${recording.title} (${recording.caseNumber})',
+                                                    style: AppTextStyles
+                                                        .headerMedium,
+                                                  ),
+                                                  const SizedBox(height: 16),
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.all(
+                                                      12,
+                                                    ),
+                                                    decoration: BoxDecoration(
+                                                      color: AppColors
+                                                          .surfaceSearchInput,
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                        AppTokens.radiusTile,
+                                                      ),
+                                                    ),
+                                                    child: WaveformScrubber(
+                                                      position:
+                                                          playerState.position,
+                                                      duration:
+                                                          playerState.duration,
+                                                      onSeek:
+                                                          playerController.seek,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 16),
+                                                  Center(
+                                                    child: Text(
+                                                      '${_formatTimestamp(playerState.position)} / ${_formatTimestamp(playerState.duration)}',
+                                                      style: AppTextStyles.body
+                                                          .copyWith(
+                                                        fontSize: 16,
+                                                        fontWeight:
+                                                            FontWeight.w500,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 16),
+                                                  Row(
+                                                    mainAxisAlignment:
+                                                        MainAxisAlignment
+                                                            .center,
+                                                    children: [
+                                                      _PlaybackButton(
+                                                        icon: Icons.replay_10,
+                                                        onPressed:
+                                                            playerController
+                                                                .rewind,
+                                                      ),
+                                                      const SizedBox(
+                                                        width: 16,
+                                                      ),
+                                                      _PlaybackButton(
+                                                        icon: playerState
+                                                                .isPlaying
+                                                            ? Icons.pause
+                                                            : Icons.play_arrow,
+                                                        onPressed:
+                                                            playerController
+                                                                .playPause,
+                                                      ),
+                                                      const SizedBox(
+                                                        width: 16,
+                                                      ),
+                                                      _PlaybackButton(
+                                                        icon: Icons.forward_10,
+                                                        onPressed:
+                                                            playerController
+                                                                .forward,
+                                                      ),
+                                                      const SizedBox(
+                                                        width: 16,
+                                                      ),
+                                                      _PlaybackButton(
+                                                        icon: Icons.download,
+                                                        onPressed: () =>
+                                                            _downloadAudio(
+                                                          recording,
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                  const SizedBox(height: 16),
+                                                  Center(
+                                                    child: Container(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 12,
+                                                        vertical: 8,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color: AppColors
+                                                            .surfaceCard,
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(
+                                                          AppTokens.radiusTile,
+                                                        ),
+                                                        border: Border.all(
+                                                          color: AppColors
+                                                              .borderSubtle,
+                                                        ),
+                                                        boxShadow: AppTokens
+                                                            .bubbleShadow,
+                                                      ),
+                                                      child: Row(
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          Text(
+                                                            'Playback Speed:',
+                                                            style: AppTextStyles
+                                                                .label
+                                                                .copyWith(
+                                                              color: AppColors
+                                                                  .textPrimary,
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w500,
+                                                            ),
+                                                          ),
+                                                          const SizedBox(
+                                                            width: 8,
+                                                          ),
+                                                          DropdownButton<
+                                                              double>(
+                                                            value: playerState
+                                                                .speed,
+                                                            items: const [
+                                                              0.5,
+                                                              1.0,
+                                                              1.5,
+                                                              2.0
+                                                            ]
+                                                                .map(
+                                                                  (speed) =>
+                                                                      DropdownMenuItem(
+                                                                    value:
+                                                                        speed,
+                                                                    child: Text(
+                                                                      '${speed}x',
+                                                                    ),
+                                                                  ),
+                                                                )
+                                                                .toList(),
+                                                            onChanged: (value) {
+                                                              if (value !=
+                                                                  null) {
+                                                                playerController
+                                                                    .setSpeed(
+                                                                  value,
+                                                                );
+                                                              }
+                                                            },
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 16),
+                                                  AudioEnhancementPanel(
+                                                    preparing:
+                                                        _preparingEnhance,
+                                                    prepareProgress:
+                                                        _prepareProgress,
+                                                    prepareStatus:
+                                                        _prepareStatus,
+                                                    onEnableRequested: () =>
+                                                        _prepareAndEnhance(
+                                                      recording,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 20),
+                                                  SizedBox(
+                                                    height: 240,
+                                                    child: Container(
+                                                      padding:
+                                                          const EdgeInsets.all(
+                                                        16,
+                                                      ),
+                                                      decoration:
+                                                          BoxDecoration(
+                                                        color: AppColors
+                                                            .surfaceSearchInput,
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(
+                                                          AppTokens.radiusTile,
+                                                        ),
+                                                        border: Border.all(
+                                                          color: AppColors
+                                                              .borderSubtle,
+                                                        ),
+                                                      ),
+                                                      child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        children: [
+                                                          Text(
+                                                            'Annotations',
+                                                            style: AppTextStyles
+                                                                .tileTitle,
+                                                          ),
+                                                          const SizedBox(
+                                                            height: 8,
+                                                          ),
+                                                          Expanded(
+                                                            child:
+                                                                _AnnotationsList(
+                                                              annotations:
+                                                                  recording
+                                                                      .annotations,
+                                                              onSeek:
+                                                                  (position) =>
+                                                                      playerController
+                                                                          .seek(
+                                                                position,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      if (!_transcriptExpanded)
+                                        const SizedBox(width: 20),
+                                      Expanded(
+                                        flex: _transcriptExpanded ? 1 : 6,
+                                        child: Container(
+                                          padding: const EdgeInsets.all(20),
+                                          decoration: BoxDecoration(
+                                            color: AppColors.surfaceCard,
+                                            borderRadius:
+                                                BorderRadius.circular(
+                                              AppTokens.radiusCard,
+                                            ),
+                                            border: Border.all(
+                                              color: AppColors.borderSubtle,
+                                            ),
+                                            boxShadow: AppTokens.cardShadow,
+                                          ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                'Transcript',
+                                                style:
+                                                    AppTextStyles.headerMedium,
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Wrap(
+                                                spacing: 6,
+                                                runSpacing: 6,
+                                                crossAxisAlignment:
+                                                    WrapCrossAlignment.center,
+                                                children: [
+                                                  // Save - only enabled if assigned
+                                                  FilledButton.icon(
+                                                    onPressed: isAssignedToMe
+                                                        ? () async {
+                                                            final success =
+                                                                await ref
+                                                                    .read(
+                                                              transcriptControllerProvider(
+                                                                recording.id,
+                                                              ).notifier,
+                                                            )
+                                                                    .save();
+                                                            if (!context
+                                                                .mounted) {
+                                                              return;
+                                                            }
+                                                            ScaffoldMessenger
+                                                                    .of(
+                                                              context,
+                                                            )
+                                                                .showSnackBar(
+                                                              SnackBar(
+                                                                content: Text(
+                                                                  success
+                                                                      ? 'Transcript saved successfully'
+                                                                      : 'Failed to save transcript',
+                                                                ),
+                                                                backgroundColor:
+                                                                    success
+                                                                        ? AppColors
+                                                                            .onlineGreen
+                                                                        : AppColors
+                                                                            .danger,
+                                                              ),
+                                                            );
+                                                          }
+                                                        : null,
+                                                    icon: const Icon(
+                                                      Icons.save,
+                                                      size: 14,
+                                                    ),
+                                                    label: const Text('Save'),
+                                                    style:
+                                                        FilledButton.styleFrom(
+                                                      backgroundColor:
+                                                          isAssignedToMe
+                                                              ? AppColors
+                                                                  .primaryDark
+                                                              : Colors.grey,
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 8,
+                                                      ),
+                                                      textStyle:
+                                                          const TextStyle(
+                                                        fontSize: 12,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  // Import - only enabled if assigned
+                                                  OutlinedButton.icon(
+                                                    onPressed: isAssignedToMe
+                                                        ? () =>
+                                                            _importWordDocument()
+                                                        : null,
+                                                    icon: const Icon(
+                                                      Icons.file_download,
+                                                      size: 14,
+                                                    ),
+                                                    label:
+                                                        const Text('Import'),
+                                                    style: OutlinedButton
+                                                        .styleFrom(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 8,
+                                                      ),
+                                                      textStyle:
+                                                          const TextStyle(
+                                                        fontSize: 12,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  // Export - only enabled if assigned
+                                                  OutlinedButton.icon(
+                                                    onPressed: isAssignedToMe
+                                                        ? () =>
+                                                            _exportTranscript(
+                                                              recording,
+                                                            )
+                                                        : null,
+                                                    icon: const Icon(
+                                                      Icons.file_upload,
+                                                      size: 14,
+                                                    ),
+                                                    label:
+                                                        const Text('Export'),
+                                                    style: OutlinedButton
+                                                        .styleFrom(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 8,
+                                                      ),
+                                                      textStyle:
+                                                          const TextStyle(
+                                                        fontSize: 12,
+                                                      ),
+                                                    ),
+                                                  ),
+                                // Expand/Collapse - always available
+                                OutlinedButton.icon(
+                                  onPressed: () => setState(
+                                      () => _transcriptExpanded = !_transcriptExpanded),
+                                  icon: const Icon(Icons.expand, size: 14),
+                                  label: Text(
+                                    _transcriptExpanded
+                                        ? 'Default View'
+                                        : 'Expand Editor',
+                                  ),
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 8,
+                                    ),
+                                    textStyle: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                // Retranscribe - only enabled if assigned
+                                OutlinedButton.icon(
+                                  onPressed: isAssignedToMe
+                                      ? () => _handleRetranscribe(context, recording)
+                                      : null,
+                                  icon: const Icon(Icons.refresh, size: 14),
+                                  label: const Text('Retranscribe'),
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: isAssignedToMe
+                                        ? Colors.redAccent
+                                        : Colors.grey,
+                                    side: BorderSide(
+                                      color: isAssignedToMe
+                                          ? Colors.redAccent
+                                          : Colors.grey,
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 8,
+                                    ),
+                                    textStyle: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                // Status dropdown - only enabled if assigned
+                                _StatusDropdown(
+                                  recordingId: recording.id,
+                                  currentStatus: recording.status,
+                                  isEnabled: isAssignedToMe && !widget.offline,
+                                ),
+                                // My List button - hidden in offline cached view
+                                if (!widget.offline)
+                                  _MyListButton(
+                                    recordingId: recording.id,
+                                    currentUserId: currentUserId,
+                                    assignedUsersAsync: assignedUsersAsync,
+                                  ),
+                                // Refresh - always available
+                                OutlinedButton.icon(
+                                  onPressed: () => ref
+                                      .refresh(recordingDetailProvider(widget.recordingId)),
+                                  icon: const Icon(Icons.sync, size: 14),
+                                  label: const Text('Refresh'),
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 8,
+                                    ),
+                                    textStyle: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            _TranscriptionStatusPanel(status: _transcriptionStatus),
+                            const SizedBox(height: 8),
+                            if (widget.offline || hasApiKey)
+                              const _AssignmentStatusIndicator(isAssigned: true)
+                            else
+                              assignedUsersAsync.when(
+                                data: (assignedUsers) {
+                                  final assignedToMe = currentUserId != null &&
+                                      assignedUsers.any(
+                                        (user) =>
+                                            user.userId == currentUserId,
+                                      );
+                                  return Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      _AssignmentStatusIndicator(
+                                        isAssigned: assignedToMe,
+                                      ),
+                                      if (assignedUsers.isNotEmpty) ...[
+                                        const SizedBox(height: 8),
+                                        Wrap(
+                                          spacing: 6,
+                                          runSpacing: 6,
+                                          children: assignedUsers
+                                              .map(
+                                                (user) => Chip(
+                                                  label: Text(
+                                                    user.name.isNotEmpty
+                                                        ? user.name
+                                                        : user.email,
+                                                    style: const TextStyle(
+                                                        fontSize: 11),
+                                                  ),
+                                                  backgroundColor:
+                                                      Colors.grey.shade200,
+                                                  materialTapTargetSize:
+                                                      MaterialTapTargetSize
+                                                          .shrinkWrap,
+                                                ),
+                                              )
+                                              .toList(),
+                                        ),
+                                      ],
+                                    ],
+                                  );
+                                },
+                                loading: () => _AssignmentStatusIndicator(
+                                  isAssigned:
+                                      assignmentState.assignment != null,
+                                ),
+                                error: (_, __) => _AssignmentStatusIndicator(
+                                  isAssigned:
+                                      assignmentState.assignment != null,
+                                ),
+                              ),
+                            const SizedBox(height: 8),
+                            Expanded(
+                              child: TranscriptEditor(
+                                key: ValueKey(
+                                  '${widget.offline ? 'offline' : 'online'}-${recording.id}',
+                                ),
+                                recordingId: recording.id,
+                                isAssigned: widget.offline || hasApiKey
+                                    ? true
+                                    : isAssignedToMe,
+                                offline: widget.offline,
+                              ),
+                            ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Positioned(
+                right: 20,
+                bottom: 20,
+                child: widget.offline
+                    ? FilledButton.icon(
+                        icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                        label: Text(
+                          'Comments (offline)',
+                          style: AppTextStyles.button,
+                        ),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppColors.primaryDark,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 10,
+                          ),
+                          minimumSize: const Size(0, 0),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(
+                              AppTokens.radiusPill,
+                            ),
+                          ),
+                        ),
+                        onPressed: null,
+                      )
+                    : CommentsPanel(recordingId: recording.id),
+              ),
+            ],
+          );
+        },
+        loading: () => const Center(
+          child: CircularProgressIndicator(color: AppColors.primaryDark),
+        ),
+        error: (error, _) => Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                mapDioError(error),
+                textAlign: TextAlign.center,
+                style: AppTextStyles.body.copyWith(
+                  color: AppColors.danger,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: () => ref.invalidate(
+                  recordingDetailProvider(widget.recordingId),
+                ),
+                icon: const Icon(Icons.refresh),
+                label: Text('Retry', style: AppTextStyles.button.copyWith(
+                  color: AppColors.primaryDark,
+                )),
+              ),
+            ],
+          ),
+        ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatTimestamp(Duration duration) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    final hours = two(duration.inHours);
+    final minutes = two(duration.inMinutes.remainder(60));
+    final secs = two(duration.inSeconds.remainder(60));
+    return '$hours:$minutes:$secs';
+  }
+
+
+  Future<void> _loadTranscriptionStatus(
+    String recordingId, {
+    bool poll = false,
+  }) async {
+    _statusTimer?.cancel();
+    try {
+      final client = ref.read(apiClientProvider).dio;
+      final response =
+          await client.get<Map<String, dynamic>>('/case_recordings/$recordingId/transcription_status');
+      
+      final currentState = (response.data?['transcription_state'] ?? 'none')
+          .toString()
+          .toLowerCase();
+      
+      // Detect state changes
+      final stateChanged = _lastKnownState != null && _lastKnownState != currentState;
+      final justCompleted = stateChanged && 
+                           currentState == 'completed' && 
+                           (_lastKnownState == 'processing' || _lastKnownState == 'queued');
+      
+      print('[TranscriptionStatus] State: $currentState (was: $_lastKnownState, changed: $stateChanged, justCompleted: $justCompleted)');
+      
+      setState(() {
+        _transcriptionStatus = response.data;
+        _lastKnownState = currentState;
+      });
+      
+      // Reset error count on success
+      _pollErrorCount = 0;
+      
+      // If job just completed, auto-refresh transcript
+      if (justCompleted && mounted) {
+        print('[TranscriptionStatus] Job completed! Refreshing transcript in 1.5 seconds...');
+        Future.delayed(const Duration(milliseconds: 1500), () {
+          if (mounted) {
+            print('[TranscriptionStatus] Reloading transcript...');
+            ref
+                .read(transcriptControllerProvider(recordingId).notifier)
+                .load();
+            
+            // Show success message
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Transcription completed! Transcript has been updated.'),
+                backgroundColor: Color(0xFF4CAF50),
+                duration: Duration(seconds: 3),
+              ),
+            );
+          }
+        });
+      }
+      
+      // Start/continue polling for active jobs
+      if (poll && (currentState == 'queued' || currentState == 'processing')) {
+        print('[TranscriptionStatus] Starting polling (state: $currentState)');
+        _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+          _loadTranscriptionStatus(recordingId);
+        });
+      } else {
+        // Stop polling when done
+        print('[TranscriptionStatus] Stopping polling (state: $currentState)');
+      }
+      
+    } catch (error) {
+      print('[TranscriptionStatus] Error loading status: $error');
+      _pollErrorCount++;
+      
+      setState(() {
+        _transcriptionStatus = {'transcription_state': 'none'};
+      });
+      
+      // Stop polling after max errors
+      if (_pollErrorCount >= _maxPollErrors) {
+        print('[TranscriptionStatus] Max errors reached ($_maxPollErrors), stopping poll');
+        _statusTimer?.cancel();
+        _pollErrorCount = 0;
+      }
+    }
+  }
+
+  /// Ensures a local copy of the recording exists (downloading if needed), then
+  /// turns on cleanup. Used for the online player where audio streams remotely.
+  Future<void> _prepareAndEnhance(Recording recording) async {
+    if (_preparingEnhance) return;
+    setState(() {
+      _preparingEnhance = true;
+      _prepareProgress = null;
+      _prepareStatus = 'Preparing audio...';
+    });
+    try {
+      final userId = ref.read(authSessionProvider).user?.id ?? '';
+      final audioPath = recording.audioPath;
+      if (userId.isEmpty || audioPath.trim().isEmpty) {
+        throw Exception('No audio available for this recording.');
+      }
+
+      final download = ref.read(offlineAudioDownloadServiceProvider);
+      final row = await download.row(
+        ownerUserId: userId,
+        recordingId: recording.id,
+      );
+      var local = row?.localPath;
+      final alreadyLocal =
+          local != null && local.isNotEmpty && File(local).existsSync();
+
+      if (!alreadyLocal) {
+        setState(() {
+          _prepareProgress = 0;
+          _prepareStatus = 'Downloading audio...';
+        });
+        local = await download.downloadForProcessing(
+          ownerUserId: userId,
+          recordingId: recording.id,
+          audioPath: audioPath,
+          onProgress: (received, total) {
+            if (!mounted) return;
+            setState(() {
+              if (total > 0) {
+                _prepareProgress = (received / total).clamp(0.0, 1.0);
+                _prepareStatus =
+                    'Downloading audio... ${_formatByteProgress(received, total)}';
+              } else {
+                _prepareProgress = null;
+                _prepareStatus =
+                    'Downloading audio... ${_formatBytes(received)}';
+              }
+            });
+          },
+        );
+      } else {
+        setState(() {
+          _prepareProgress = 1;
+          _prepareStatus = 'Audio ready';
+        });
+      }
+
+      if (local.isEmpty || !File(local).existsSync()) {
+        throw Exception('Could not prepare audio for processing.');
+      }
+
+      setState(() {
+        _prepareProgress = null;
+        _prepareStatus = 'Processing audio...';
+      });
+
+      final notifier = ref.read(audioEnhancementControllerProvider.notifier);
+      notifier.setOriginal(local);
+      await notifier.setEnabled(true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Could not enable cleanup: ${e.toString().replaceAll('Exception: ', '')}',
+            ),
+            backgroundColor: const Color(0xFFD32F2F),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _preparingEnhance = false;
+          _prepareProgress = null;
+          _prepareStatus = '';
+        });
+      }
+    }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  String _formatByteProgress(int received, int total) {
+    return '${_formatBytes(received)} / ${_formatBytes(total)}';
+  }
+
+  Future<void> _downloadAudio(Recording recording) async {
+    try {
+      final config = ref.read(appConfigProvider);
+      final uri = _buildAudioUri(
+        baseUrl: config.audioBaseUrl,
+        audioPath: recording.audioPath,
+      );
+      if (uri == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Audio URL is empty')),
+          );
+        }
+        return;
+      }
+
+      final filename =
+          uri.pathSegments.isNotEmpty ? uri.pathSegments.last : 'audio';
+      final location = await getSaveLocation(suggestedName: filename);
+      if (location == null) return;
+
+      final dio = ref.read(apiClientProvider).dio;
+      await dio.downloadUri(uri, location.path);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Audio saved to ${location.path}')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to download audio: $error')),
+        );
+      }
+    }
+  }
+
+  Uri? _buildAudioUri({
+    required String baseUrl,
+    required String audioPath,
+  }) {
+    final trimmed = audioPath.trim();
+    if (trimmed.isEmpty) return null;
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed != null && parsed.hasScheme) {
+      return parsed;
+    }
+
+    var normalized = trimmed.replaceAll('\\', '/').replaceFirst(RegExp(r'^/+'), '');
+    final recordingsIndex = normalized.indexOf('recordings/');
+    if (recordingsIndex >= 0) {
+      normalized = normalized.substring(recordingsIndex + 'recordings/'.length);
+    } else if (normalized.contains('media/recordings/')) {
+      normalized = normalized.split('media/recordings/').last;
+    }
+
+    final filename = normalized.split('/').last;
+    final base = Uri.parse(baseUrl);
+    return base.replace(
+      pathSegments: [
+        ...base.pathSegments.where((segment) => segment.isNotEmpty),
+        'recordings',
+        filename,
+      ],
+    );
+  }
+
+  Future<void> _exportTranscript(Recording recording) async {
+    try {
+      print('[Export] Starting export for recording ${recording.id}');
+      
+      // Get transcript content
+      final state = ref.read(transcriptControllerProvider(recording.id));
+      final delta = state.controller.document.toDelta();
+      print('[Export] Got transcript delta: ${delta.length} operations');
+      
+      // Convert delta to HTML
+      final transcriptHtml = _deltaToHtml(delta);
+      print('[Export] Converted to HTML: ${transcriptHtml.length} chars');
+
+      final caseNumber = recording.caseNumber.isNotEmpty
+          ? recording.caseNumber
+          : 'unknown_case';
+      final title = recording.title.isNotEmpty ? recording.title : 'Untitled';
+      final judge = recording.judgeName.isNotEmpty ? recording.judgeName : 'N/A';
+      final dateStamp = recording.date.toIso8601String();
+      final prosecution = recording.prosecutionCounsel.isNotEmpty
+          ? recording.prosecutionCounsel
+          : 'N/A';
+      final defense = recording.defenseCounsel.isNotEmpty
+          ? recording.defenseCounsel
+          : 'N/A';
+
+      // Build complete HTML document
+      final html = '''
+<!DOCTYPE html>
+<html xmlns:o="urn:schemas-microsoft-com:office:office"
+      xmlns:w="urn:schemas-microsoft-com:office:word"
+      xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+  <meta charset="UTF-8">
+  <meta name="ProgId" content="Word.Document">
+  <meta name="Generator" content="Transcriber App">
+  <meta name="Originator" content="Transcriber App">
+  <title>Court Transcript - $caseNumber</title>
+  <!--[if gte mso 9]><xml>
+   <w:WordDocument>
+    <w:View>Print</w:View>
+    <w:Zoom>100</w:Zoom>
+    <w:DoNotOptimizeForBrowser/>
+   </w:WordDocument>
+  </xml><![endif]-->
+  <style>
+    @page {
+      size: 8.5in 11in;
+      margin: 1in 1in 1in 1in;
+      mso-header-margin: .5in;
+      mso-footer-margin: .5in;
+    }
+    body {
+      font-family: 'Times New Roman', serif;
+      font-size: 12pt;
+      line-height: 1.6;
+      margin: 0;
+      padding: 40px;
+    }
+    h1 {
+      color: #115343;
+      border-bottom: 2px solid #115343;
+      padding-bottom: 10px;
+      font-size: 18pt;
+      font-weight: bold;
+      margin-top: 12pt;
+      margin-bottom: 12pt;
+    }
+    h2 {
+      color: #115343;
+      font-size: 16pt;
+      font-weight: bold;
+      margin-top: 10pt;
+      margin-bottom: 10pt;
+    }
+    h3 {
+      color: #115343;
+      font-size: 14pt;
+      font-weight: bold;
+      margin-top: 8pt;
+      margin-bottom: 8pt;
+    }
+    .metadata {
+      background: #f5f5f5;
+      padding: 15px;
+      border: 1px solid #ddd;
+      margin-bottom: 20px;
+    }
+    .metadata p {
+      margin: 5px 0;
+    }
+    p {
+      margin: 6pt 0;
+      text-align: justify;
+    }
+    strong {
+      font-weight: bold;
+    }
+    em {
+      font-style: italic;
+    }
+    u {
+      text-decoration: underline;
+    }
+    s {
+      text-decoration: line-through;
+    }
+    a {
+      color: #115343;
+      text-decoration: underline;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #ccc;
+      margin: 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>Court Transcript: $title ($caseNumber)</h1>
+  <div class="metadata">
+    <p><strong>Judge:</strong> $judge</p>
+    <p><strong>Date:</strong> $dateStamp</p>
+    <p><strong>Prosecution Counsel:</strong> $prosecution</p>
+    <p><strong>Defense Counsel:</strong> $defense</p>
+  </div>
+  <hr>
+  <div class="transcript">
+    $transcriptHtml
+  </div>
+</body>
+</html>
+''';
+
+      // Prepare metadata for the export
+      final metadata = {
+        'case_number': caseNumber,
+        'title': title,
+        'judge': judge,
+        'date': dateStamp,
+        'prosecution_counsel': prosecution,
+        'defense_counsel': defense,
+      };
+
+      // Use WordExportService to convert HTML to DOCX via Flask API
+      final exportService = ref.read(wordExportServiceProvider);
+      await exportService.exportHtmlToWord(
+        context: context,
+        htmlContent: html,
+        fileName: 'transcript_$caseNumber',
+        metadata: metadata,
+      );
+      
+      print('[Export] Export completed successfully');
+    } catch (e, stack) {
+      print('[Export] Error: $e');
+      print('[Export] Stack: $stack');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to export: $e'),
+            backgroundColor: const Color(0xFFD32F2F),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _importWordDocument() async {
+    try {
+      final importService = ref.read(wordImportServiceProvider);
+      final html = await importService.importWordToHtml(context: context);
+      
+      // If user cancelled, html will be null - just return silently
+      if (html == null) {
+        return;
+      }
+      
+      // Replace content in transcript controller
+      await ref
+          .read(transcriptControllerProvider(widget.recordingId).notifier)
+          .replaceContent(html);
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Word document imported successfully'),
+            backgroundColor: Color(0xFF4CAF50),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      print('[Import] Error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to import Word document: ${e.toString().replaceAll('Exception: ', '')}'),
+            backgroundColor: const Color(0xFFD32F2F),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    }
+  }
+
+  String _deltaToHtml(dynamic delta) {
+    final buffer = StringBuffer();
+    
+    final ops = delta.toList();
+    bool inParagraph = false;
+    String? currentBlockTag;
+    
+    for (var i = 0; i < ops.length; i++) {
+      final op = ops[i];
+      final data = op.data;
+      
+      if (data is! String) continue;
+
+      final attributes = op.attributes ?? {};
+      final text = data.toString();
+
+      // Handle newlines
+      if (text == '\n') {
+        // Close current block if open
+        if (inParagraph && currentBlockTag != null) {
+          buffer.write('</$currentBlockTag>');
+          inParagraph = false;
+          currentBlockTag = null;
+        }
+        
+        // Check if next operation is also a newline (consecutive newlines)
+        bool isConsecutiveNewline = false;
+        if (i < ops.length - 1) {
+          final nextOp = ops[i + 1];
+          final nextData = nextOp.data;
+          if (nextData is String && nextData == '\n') {
+            isConsecutiveNewline = true;
+          }
+        }
+        
+        // If consecutive newlines or last operation, create empty paragraph for spacing
+        if (isConsecutiveNewline || i == ops.length - 1) {
+          buffer.write('<p>&nbsp;</p>');
+        }
+        
+        // Start new block if there's more content
+        if (i < ops.length - 1) {
+          final header = attributes['header'];
+          if (header != null) {
+            currentBlockTag = 'h$header';
+            buffer.write('<h$header>');
+            inParagraph = true;
+          } else {
+            currentBlockTag = 'p';
+            buffer.write('<p>');
+            inParagraph = true;
+          }
+        }
+        continue;
+      }
+
+      // Start paragraph/header if needed (beginning of content or after newline)
+      if (!inParagraph) {
+        final header = attributes['header'];
+        if (header != null) {
+          currentBlockTag = 'h$header';
+          buffer.write('<h$header>');
+          inParagraph = true;
+        } else {
+          currentBlockTag = 'p';
+          buffer.write('<p>');
+          inParagraph = true;
+        }
+      }
+
+      // Apply inline formatting
+      var formattedText = _escapeHtml(text);
+      
+      if (attributes['bold'] == true) {
+        formattedText = '<strong>$formattedText</strong>';
+      }
+      if (attributes['italic'] == true) {
+        formattedText = '<em>$formattedText</em>';
+      }
+      if (attributes['underline'] == true) {
+        formattedText = '<u>$formattedText</u>';
+      }
+      if (attributes['strike'] == true) {
+        formattedText = '<s>$formattedText</s>';
+      }
+      final link = attributes['link'];
+      if (link != null) {
+        formattedText = '<a href="$link">$formattedText</a>';
+      }
+
+      buffer.write(formattedText);
+    }
+
+    // Close any open paragraph/header
+    if (inParagraph && currentBlockTag != null) {
+      buffer.write('</$currentBlockTag>');
+    }
+
+    if (buffer.isEmpty) {
+      return '<p>No transcript available.</p>';
+    }
+
+    return buffer.toString();
+  }
+
+  String _escapeHtml(String text) {
+    return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+  }
+
+  Future<void> _handleRetranscribe(BuildContext context, Recording recording) async {
+    // Step 1: Show confirmation dialog
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning, color: Colors.orange.shade700),
+            const SizedBox(width: 8),
+            const Text('Confirm Retranscribe'),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'This will re-run transcription and overwrite the currently saved transcript.',
+              style: TextStyle(fontWeight: FontWeight.w500),
+            ),
+            SizedBox(height: 12),
+            Text(
+              'Are you sure you want to continue?',
+              style: TextStyle(color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+            ),
+            child: const Text('Retranscribe'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !context.mounted) return;
+
+    // Step 2: Get user ID
+    final authState = ref.read(authSessionProvider);
+    final userId = authState.user?.id;
+    if (userId == null) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Unable to determine user ID'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    // Step 3: Show loading
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Text('Queueing transcription job...'),
+            ],
+          ),
+          duration: const Duration(seconds: 30),
+        ),
+      );
+    }
+
+    // Step 4: Call retranscribe
+    print('[RecordingDetail] Calling retranscribe with userId=$userId recordingId=${recording.id}');
+    
+    Map<String, dynamic> response;
+    try {
+      response = await ref
+          .read(transcriptControllerProvider(recording.id).notifier)
+          .retranscribe(userId);
+      print('[RecordingDetail] Retranscribe response: $response');
+    } catch (error, stack) {
+      print('[RecordingDetail] Retranscribe error: $error');
+      print('[RecordingDetail] Stack: $stack');
+      
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: ${error.toString()}'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    if (!context.mounted) return;
+
+    // Step 5: Handle response
+    ScaffoldMessenger.of(context).clearSnackBars();
+
+    if (response.containsKey('error')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(response['message'] ?? response['error']),
+          backgroundColor: Colors.orange.shade700,
+        ),
+      );
+    } else if (response['already_exists'] == true) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            response['message'] ?? 'A transcription job already exists for this recording.',
+          ),
+          backgroundColor: Colors.blue.shade700,
+        ),
+      );
+    } else {
+      final queuePos = response['queue_position'];
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Job Queued Successfully!\n${queuePos != null ? 'Position in queue: $queuePos' : 'The transcript will update automatically when processing completes.'}',
+          ),
+          backgroundColor: const Color(0xFF4CAF50),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      
+      // Reload transcription status to show the queued job
+      print('[RecordingDetail] Reloading transcription status after job queued');
+      _loadTranscriptionStatus(recording.id, poll: true);
+    }
+  }
+}
+
+class _PlaybackButton extends StatelessWidget {
+  const _PlaybackButton({
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return ElevatedButton(
+      onPressed: onPressed,
+      style: ElevatedButton.styleFrom(
+        backgroundColor: AppColors.primaryDark,
+        foregroundColor: Colors.white,
+        shape: const CircleBorder(),
+        padding: const EdgeInsets.all(16),
+        elevation: 0,
+      ),
+      child: Icon(icon),
+    );
+  }
+}
+
+class _TranscriptionStatusPanel extends StatelessWidget {
+  const _TranscriptionStatusPanel({required this.status});
+
+  final Map<String, dynamic>? status;
+
+  String _formatTimestamp(String? timestamp) {
+    if (timestamp == null || timestamp.isEmpty) return '';
+    
+    try {
+      final dateTime = DateTime.parse(timestamp);
+      final now = DateTime.now();
+      final difference = now.difference(dateTime);
+      
+      // If less than 1 minute ago
+      if (difference.inSeconds < 60) {
+        return 'just now';
+      }
+      // If less than 1 hour ago
+      else if (difference.inMinutes < 60) {
+        final mins = difference.inMinutes;
+        return '$mins ${mins == 1 ? 'minute' : 'minutes'} ago';
+      }
+      // If less than 24 hours ago
+      else if (difference.inHours < 24) {
+        final hours = difference.inHours;
+        return '$hours ${hours == 1 ? 'hour' : 'hours'} ago';
+      }
+      // If less than 7 days ago
+      else if (difference.inDays < 7) {
+        final days = difference.inDays;
+        return '$days ${days == 1 ? 'day' : 'days'} ago';
+      }
+      // Otherwise show formatted date
+      else {
+        final month = dateTime.month.toString().padLeft(2, '0');
+        final day = dateTime.day.toString().padLeft(2, '0');
+        final year = dateTime.year;
+        final hour = dateTime.hour.toString().padLeft(2, '0');
+        final minute = dateTime.minute.toString().padLeft(2, '0');
+        return '$month/$day/$year at $hour:$minute';
+      }
+    } catch (e) {
+      return timestamp;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = (status?['transcription_state'] ?? 'none')
+        .toString()
+        .toLowerCase();
+    final activeJobs = status?['active_jobs'] as List<dynamic>? ?? [];
+    final lastTranscribedAt = status?['last_transcribed_at'] as String?;
+
+    String label = 'No Transcription';
+    String details = 'No transcription job has been created. Click "Retranscribe" to start transcription.';
+    IconData icon = Icons.circle;
+    Color color = Colors.grey;
+
+    if (state == 'queued') {
+      label = 'Transcription Queued';
+      final job = activeJobs.isNotEmpty ? activeJobs.first : null;
+      final queuePos = job is Map ? job['queue_position'] : null;
+      details = queuePos == null ? 'Waiting in queue...' : 'Position $queuePos in queue';
+      icon = Icons.access_time;
+      color = Colors.orange;
+    } else if (state == 'processing') {
+      label = 'Transcription Processing';
+      icon = Icons.sync;
+      color = Colors.blue;
+      
+      // Calculate elapsed time from started_at
+      if (activeJobs.isNotEmpty) {
+        final job = activeJobs.first as Map<String, dynamic>?;
+        final startedAt = job?['started_at'] as String?;
+        
+        if (startedAt != null && startedAt.isNotEmpty) {
+          try {
+            final started = DateTime.parse(startedAt);
+            final now = DateTime.now();
+            final elapsed = now.difference(started);
+            
+            if (elapsed.inSeconds >= 0 && elapsed.inSeconds < 86400) {
+              final minutes = elapsed.inMinutes;
+              final seconds = elapsed.inSeconds % 60;
+              if (minutes > 0) {
+                details = 'Started ${minutes}m ${seconds}s ago';
+              } else {
+                details = 'Started ${seconds}s ago';
+              }
+            } else {
+              details = 'Processing audio...';
+            }
+          } catch (e) {
+            details = 'Processing audio...';
+          }
+        } else {
+          details = 'Processing audio...';
+        }
+      } else {
+        details = 'Processing audio...';
+      }
+    } else if (state == 'completed') {
+      label = 'Transcription Completed';
+      final formattedTime = _formatTimestamp(lastTranscribedAt);
+      details = formattedTime.isEmpty
+          ? 'Transcription is ready'
+          : 'Completed $formattedTime';
+      icon = Icons.check_circle;
+      color = Colors.green;
+    } else if (state == 'failed') {
+      label = 'Transcription Failed';
+      icon = Icons.error;
+      color = Colors.red;
+      
+      // Try to get error message from last_job
+      final lastJob = status?['last_job'] as Map<String, dynamic>?;
+      final errorMessage = lastJob?['error_message'] as String?;
+      
+      if (errorMessage != null && errorMessage.isNotEmpty) {
+        // Truncate long error messages
+        final truncated = errorMessage.length > 150
+            ? '${errorMessage.substring(0, 150)}...'
+            : errorMessage;
+        details = 'Error: $truncated';
+      } else {
+        details = 'Transcription job failed. You can retry using the Retranscribe button.';
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceSearchInput,
+        borderRadius: BorderRadius.circular(AppTokens.radiusTile),
+        border: Border.all(color: AppColors.borderSubtle),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: AppTextStyles.tileTitle,
+                ),
+                Text(
+                  details,
+                  style: AppTextStyles.tileSnippet,
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(AppTokens.radiusTile),
+            ),
+            child: Text(
+              state.toUpperCase(),
+              style: AppTextStyles.label.copyWith(
+                fontWeight: FontWeight.w600,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AssignmentStatusIndicator extends StatelessWidget {
+  const _AssignmentStatusIndicator({required this.isAssigned});
+
+  final bool isAssigned;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isAssigned ? const Color(0xFFD4EDDA) : const Color(0xFFF8D7DA),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isAssigned ? const Color(0xFFC3E6CB) : const Color(0xFFF5C6CB),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.info,
+            color: isAssigned ? const Color(0xFF155724) : const Color(0xFF721C24),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              isAssigned
+                  ? 'You are assigned to this recording. You can edit the transcript.'
+                  : 'You are not assigned to this recording. You can only add comments.',
+              style: GoogleFonts.roboto(
+                color: isAssigned ? const Color(0xFF155724) : const Color(0xFF721C24),
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AnnotationsList extends StatelessWidget {
+  const _AnnotationsList({
+    required this.annotations,
+    required this.onSeek,
+  });
+
+  final List<Map<String, dynamic>> annotations;
+  final ValueChanged<Duration> onSeek;
+
+  @override
+  Widget build(BuildContext context) {
+    if (annotations.isEmpty) {
+      return Center(
+        child: Text(
+          'No annotations available',
+          style: GoogleFonts.roboto(color: Colors.grey[600]),
+        ),
+      );
+    }
+
+    return ListView.separated(
+      itemCount: annotations.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final annotation = annotations[index];
+        final rawTimestamp = annotation['timestamp'] ??
+            annotation['time_stamp'] ??
+            annotation['time'] ??
+            'N/A';
+        final details = annotation['details'] ??
+            annotation['text'] ??
+            annotation['content'] ??
+            annotation['note'] ??
+            '';
+        final displayTimestamp = formatAnnotationTimestamp(rawTimestamp);
+
+        return ListTile(
+          dense: true,
+          title: Text(
+            displayTimestamp,
+            style: GoogleFonts.roboto(fontWeight: FontWeight.w600),
+          ),
+          subtitle: Text(
+            details.toString(),
+            style: GoogleFonts.roboto(fontSize: 12),
+          ),
+          onTap: () {
+            final position = parseAnnotationTimestamp(rawTimestamp);
+            if (position != null) {
+              onSeek(position);
+            }
+          },
+        );
+      },
+    );
+  }
+}
+
+/// Separate stateful widget for My List button to properly handle loading state
+class _MyListButton extends ConsumerStatefulWidget {
+  const _MyListButton({
+    required this.recordingId,
+    required this.currentUserId,
+    required this.assignedUsersAsync,
+  });
+
+  final String recordingId;
+  final String? currentUserId;
+  final AsyncValue<List<AssignedUser>> assignedUsersAsync;
+
+  @override
+  ConsumerState<_MyListButton> createState() => _MyListButtonState();
+}
+
+class _MyListButtonState extends ConsumerState<_MyListButton> {
+  bool _isOperationInProgress = false;
+
+  Future<void> _handleMyListAction(bool isCurrentlyAssigned) async {
+    if (_isOperationInProgress) return;
+    if (widget.currentUserId == null || widget.currentUserId!.isEmpty) return;
+
+    setState(() => _isOperationInProgress = true);
+
+    try {
+      // Step 1: Call API and wait for response
+      if (isCurrentlyAssigned) {
+        print('[RecordingDetailScreen] DELETE unassign case_id=${widget.recordingId} user_id=${widget.currentUserId}');
+        await ref.read(assignmentRepositoryProvider).unassignRecording(
+          widget.recordingId,
+          userId: widget.currentUserId!,
+        );
+      } else {
+        print('[RecordingDetailScreen] POST assign case_id=${widget.recordingId} user_id=${widget.currentUserId}');
+        await ref.read(assignmentRepositoryProvider).assignRecording(
+          widget.recordingId,
+          userId: widget.currentUserId!,
+        );
+      }
+      print('[RecordingDetailScreen] API returned success');
+
+      // Step 2: Clear state and reload fresh from API
+      print('[RecordingDetailScreen] Clearing state and reloading from API...');
+      ref.invalidate(assignedUsersProvider(widget.recordingId));
+      await ref.read(recordingsControllerProvider.notifier).loadInitial();
+      print('[RecordingDetailScreen] Reload from API completed');
+      
+      // No snackbar - UI will update because we reloaded
+    } catch (e) {
+      print('[RecordingDetailScreen] API error: $e');
+      if (mounted) {
+        String errorMessage = 'Operation failed';
+        
+        if (e is DioException) {
+          final statusCode = e.response?.statusCode;
+          final responseData = e.response?.data;
+          
+          // Check for duplicate/conflict errors (400 or 409)
+          if (statusCode == 400 || statusCode == 409) {
+            // Check if it's a duplicate error
+            String? apiMessage;
+            if (responseData is Map) {
+              apiMessage = responseData['message']?.toString() ?? 
+                          responseData['error']?.toString();
+            } else if (responseData is String) {
+              apiMessage = responseData;
+            }
+            
+            // Check if the message indicates a duplicate
+            final messageLower = (apiMessage ?? '').toLowerCase();
+            if (messageLower.contains('duplicate') || 
+                messageLower.contains('already') || 
+                messageLower.contains('exists') ||
+                messageLower.contains('already assigned')) {
+              errorMessage = isCurrentlyAssigned 
+                  ? 'This case is already removed from your list'
+                  : 'This case is already in your list';
+            } else if (apiMessage != null && apiMessage.isNotEmpty) {
+              // Use the API message if it's short and clear
+              errorMessage = apiMessage.length > 100 
+                  ? (isCurrentlyAssigned 
+                      ? 'This case is already removed from your list'
+                      : 'This case is already in your list')
+                  : apiMessage;
+            } else {
+              errorMessage = isCurrentlyAssigned 
+                  ? 'This case is already removed from your list'
+                  : 'This case is already in your list';
+            }
+          } else {
+            // For other errors, try to extract a clean message
+            if (responseData is Map) {
+              final apiMessage = responseData['message']?.toString() ?? 
+                                responseData['error']?.toString();
+              if (apiMessage != null && apiMessage.isNotEmpty) {
+                // Only use if it's a reasonable length
+                errorMessage = apiMessage.length > 150 
+                    ? 'Operation failed. Please try again.'
+                    : apiMessage;
+              }
+            } else if (responseData is String && responseData.length <= 150) {
+              errorMessage = responseData;
+            } else {
+              errorMessage = 'Operation failed. Please try again.';
+            }
+          }
+        }
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: errorMessage.contains('already') 
+                ? Colors.orange.shade700 
+                : Colors.red.shade700,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isOperationInProgress = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return widget.assignedUsersAsync.when(
+      data: (assignedUsers) {
+        final isAssignedToMe = widget.currentUserId != null &&
+            assignedUsers.any((user) => user.userId == widget.currentUserId);
+        return OutlinedButton.icon(
+          onPressed: _isOperationInProgress
+              ? null
+              : () => _handleMyListAction(isAssignedToMe),
+          icon: _isOperationInProgress
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Icon(
+                  isAssignedToMe ? Icons.remove_circle_outline : Icons.playlist_add,
+                  size: 14,
+                ),
+          label: Text(
+            _isOperationInProgress
+                ? (isAssignedToMe ? 'Removing...' : 'Adding...')
+                : (isAssignedToMe ? 'Remove from My List' : 'Add to My List'),
+          ),
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            textStyle: const TextStyle(fontSize: 12),
+          ),
+        );
+      },
+      loading: () => OutlinedButton.icon(
+        onPressed: null,
+        icon: const SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        label: const Text('Loading...'),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          textStyle: const TextStyle(fontSize: 12),
+        ),
+      ),
+      error: (_, __) => OutlinedButton.icon(
+        onPressed: widget.currentUserId == null
+            ? null
+            : () => _handleMyListAction(false),
+        icon: const Icon(Icons.playlist_add, size: 14),
+        label: const Text('Add to My List'),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          textStyle: const TextStyle(fontSize: 12),
+        ),
+      ),
+    );
+  }
+}
+
+/// Status dropdown with pill styling - handles API call, wait, reload.
+class _StatusDropdown extends ConsumerStatefulWidget {
+  const _StatusDropdown({
+    required this.recordingId,
+    required this.currentStatus,
+    this.isEnabled = true,
+  });
+
+  final String recordingId;
+  final String currentStatus;
+  final bool isEnabled;
+
+  @override
+  ConsumerState<_StatusDropdown> createState() => _StatusDropdownState();
+}
+
+class _StatusDropdownState extends ConsumerState<_StatusDropdown> {
+  bool _isUpdating = false;
+  late String _selectedStatus;
+
+  // Valid statuses for the Flask API
+  static const _validStatuses = ['pending', 'inprogress', 'completed'];
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedStatus = _normalizeStatus(widget.currentStatus);
+  }
+
+  @override
+  void didUpdateWidget(covariant _StatusDropdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentStatus != widget.currentStatus) {
+      _selectedStatus = _normalizeStatus(widget.currentStatus);
+    }
+  }
+
+  String _normalizeStatus(String raw) {
+    final value = raw.trim().toLowerCase().replaceAll('_', '').replaceAll('-', '');
+    if (value.isEmpty) return 'pending';
+    switch (value) {
+      case 'pending':
+      case 'pendingtranscription':
+        return 'pending';
+      case 'inprogress':
+      case 'processing':
+        return 'inprogress';
+      case 'completed':
+      case 'reviewed':
+        return 'completed';
+      default:
+        return 'pending';
+    }
+  }
+
+  String _displayStatus(String status) {
+    switch (status) {
+      case 'pending':
+        return 'Pending';
+      case 'inprogress':
+        return 'In Progress';
+      case 'completed':
+        return 'Completed';
+      default:
+        return status;
+    }
+  }
+
+  Color _getStatusColor(String status) {
+    switch (status) {
+      case 'pending':
+        return const Color(0xFFFF9800); // Orange
+      case 'inprogress':
+        return const Color(0xFF2196F3); // Blue
+      case 'completed':
+        return const Color(0xFF4CAF50); // Green
+      default:
+        return const Color(0xFF757575); // Grey
+    }
+  }
+
+  Future<void> _handleStatusChange(String newStatus) async {
+    if (_isUpdating || newStatus == _selectedStatus) return;
+
+    setState(() => _isUpdating = true);
+
+    try {
+      print('[StatusDropdown] PUT /case_recordings/${widget.recordingId}/update_status status=$newStatus');
+      await ref.read(statusRepositoryProvider).updateStatus(
+        recordingId: widget.recordingId,
+        status: newStatus,
+      );
+      print('[StatusDropdown] API returned success');
+
+      ref.invalidate(recordingDetailProvider(widget.recordingId));
+      await ref.read(recordingsControllerProvider.notifier).loadInitial();
+
+      setState(() {
+        _selectedStatus = newStatus;
+      });
+    } catch (e) {
+      print('[StatusDropdown] API error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to update status: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isUpdating = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final statusColor = widget.isEnabled
+        ? _getStatusColor(_selectedStatus)
+        : Colors.grey;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      decoration: BoxDecoration(
+        color: statusColor.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: statusColor.withOpacity(0.3),
+          width: 1,
+        ),
+      ),
+      child: _isUpdating
+          ? Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(statusColor),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Updating...',
+                    style: GoogleFonts.roboto(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: statusColor,
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: _selectedStatus,
+                isDense: true,
+                icon: Icon(Icons.arrow_drop_down, color: statusColor, size: 20),
+                style: GoogleFonts.roboto(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: statusColor,
+                ),
+                dropdownColor: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+                items: _validStatuses.map((status) {
+                  final color = _getStatusColor(status);
+                  return DropdownMenuItem(
+                    value: status,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: color.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        _displayStatus(status),
+                        style: GoogleFonts.roboto(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: color,
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+                selectedItemBuilder: (context) {
+                  return _validStatuses.map((status) {
+                    final color = widget.isEnabled
+                        ? _getStatusColor(status)
+                        : Colors.grey;
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      child: Text(
+                        _displayStatus(status),
+                        style: GoogleFonts.roboto(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: color,
+                        ),
+                      ),
+                    );
+                  }).toList();
+                },
+                onChanged: widget.isEnabled
+                    ? (value) {
+                        if (value != null) {
+                          _handleStatusChange(value);
+                        }
+                      }
+                    : null,
+              ),
+            ),
+    );
+  }
+}

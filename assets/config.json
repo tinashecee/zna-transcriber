@@ -1,0 +1,5 @@
+{
+  "apiBaseUrl": "http://192.168.1.51:5000",
+  "audioBaseUrl": "http://192.168.1.51:5000",
+  "pedalWebSocketUrl": "ws://127.0.0.1:8080"
+}

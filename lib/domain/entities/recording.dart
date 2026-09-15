@@ -1,0 +1,31 @@
+class Recording {
+  const Recording({
+    required this.id,
+    required this.caseNumber,
+    required this.title,
+    required this.court,
+    required this.courtroom,
+    required this.judgeName,
+    required this.prosecutionCounsel,
+    required this.defenseCounsel,
+    required this.date,
+    required this.status,
+    required this.audioPath,
+    required this.durationSeconds,
+    required this.annotations,
+  });
+
+  final String id;
+  final String caseNumber;
+  final String title;
+  final String court;
+  final String courtroom;
+  final String judgeName;
+  final String prosecutionCounsel;
+  final String defenseCounsel;
+  final DateTime date;
+  final String status;
+  final String audioPath;
+  final double? durationSeconds;
+  final List<Map<String, dynamic>> annotations;
+}
